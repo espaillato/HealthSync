@@ -42,15 +42,21 @@ will succeed silently and land in the service account's own invisible Drive inst
    the whole problem: every sync from then on only ever updates, never creates. (The app
    surfaces this exact explanation in its status line if you hit it before reading this.)
 
-5. **Push the key onto each phone**, into the app's private storage (requires USB debugging
-   enabled and `adb` installed — this only needs to happen once per phone, after the app is
-   first installed):
+5. **Get the key file onto each phone**, then import it from inside the app — tap **Import
+   Drive Key** on the main screen (shown automatically whenever no key is present yet), and
+   pick the file in the system file browser. This works via a normal `content://` URI, so it
+   doesn't matter whether the picker shows the file as `application/json`, `text/plain`, or
+   something else a browser/email client guessed — filter is deliberately permissive.
 
-   ```bash
-   adb push /path/to/your-key.json /data/local/tmp/drive_service_account.json
-   adb shell run-as com.espaillat.healthsync cp /data/local/tmp/drive_service_account.json files/drive_service_account.json
-   adb shell rm /data/local/tmp/drive_service_account.json
-   ```
+   Get the key file onto the phone however's convenient (AirDrop-equivalent, email it to
+   yourself, USB file copy, `adb push /path/to/key.json /sdcard/Download/`, etc.) — it just
+   needs to be somewhere the file picker can browse to, e.g. Downloads. Once imported, feel
+   free to delete it from wherever you staged it; it's now copied into the app's private
+   storage.
+
+   *(Note: `adb shell run-as` — the old way to place this file directly — only works on
+   debuggable builds. A release build, which is what you should actually be running long-term,
+   rejects it outright with "package not debuggable". The in-app import works on both.)*
 
    Repeat for Max's phone with the same key file — both installs share one service account.
 
@@ -59,18 +65,48 @@ will succeed silently and land in the service account's own invisible Drive inst
 Requires a JDK 17+ and the Android SDK (compileSdk/targetSdk 36, minSdk 26).
 
 ```bash
-./gradlew assembleDebug
+./gradlew assembleDebug     # quick iteration, debug-signed, run-as works for adb debugging
+./gradlew assembleRelease   # what you should actually install long-term, see below
 ```
 
-The APK lands at `app/build/outputs/apk/debug/app-debug.apk`.
+Debug output lands at `app/build/outputs/apk/debug/app-debug.apk`, release at
+`app/build/outputs/apk/release/app-release.apk`.
+
+### Release signing (one-time, before the first `assembleRelease`)
+
+Not committed, not optional — `assembleRelease` silently fails without it. Generate a keystore
+once and reuse it forever; **losing it or regenerating it means every future release build is
+signed differently and Android will refuse to install it over the previous one** (a
+differently-signed APK requires a full uninstall first, which wipes local app storage — see
+"Reinstalling" below for why that's safe, but it's still an avoidable hassle). Back this file
+up somewhere durable outside the repo.
+
+```bash
+keytool -genkeypair -v -keystore healthsync-release.jks -alias healthsync \
+  -keyalg RSA -keysize 2048 -validity 10000
+```
+
+Then create `keystore.properties` in the project root (gitignored, alongside the `.jks` file):
+
+```properties
+storeFile=healthsync-release.jks
+storePassword=<the password you set>
+keyAlias=healthsync
+keyPassword=<same password — PKCS12 keystores don't support separate store/key passwords>
+```
 
 ## Install (sideload, both phones)
 
-No Play Store distribution — this is a personal two-phone tool.
+No Play Store distribution — this is a personal two-phone tool. Install the **release** build
+day-to-day; debug is for iterating on the code itself.
 
 ```bash
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/release/app-release.apk
 ```
+
+(No `adb`/USB debugging on the target phone at all? Just copy the APK file onto the phone
+however's convenient and tap it to install — Android will prompt to allow installing from
+whatever app you opened it with.)
 
 Android/Play Protect may warn about an unrecognized app on install — that's expected for a
 sideloaded APK; dismiss it.
@@ -93,6 +129,33 @@ Each install writes to its own file — `Ozzy_Samsung_Health_Sync.csv` or
 `Max_Samsung_Health_Sync.csv` — inside the shared `Wearable_Data` folder, so the two datasets
 never collide.
 
+### Installing on Max's phone
+
+Drive-side setup (service account, shared folder, placeholder CSVs) is shared and already
+done — it's a one-time thing for the whole setup, not per-phone. Max's phone just needs:
+
+1. Get `app-release.apk` onto the phone (however's convenient) and tap it to install.
+2. Open the app → tap **Max** on the owner picker.
+3. Grant Health Connect permissions when prompted (or tap **Sync Now** to trigger the prompt).
+4. Get the same service-account key file onto the phone and tap **Import Drive Key** to pick
+   it — same key file as Ozzy's phone, both installs share one service account.
+5. Confirm **"Last sync succeeded"** appears.
+
+No `adb` or USB debugging required anywhere in that list — steps 1 and 4 just need the two
+files (APK, key) to reach the phone by whatever channel is easiest (send them directly, don't
+use a public link for the key file, it's a credential).
+
+### Reinstalling, or switching to a differently-signed build
+
+Safe. A reinstall (or moving from debug-signed to release-signed, which Android treats as a
+different app and requires a full uninstall first) wipes local app storage — owner choice,
+sync cursor, cached Drive file ID. The next sync after that re-reads Health Connect's full
+retention window from scratch, same as a true fresh install. That's expected, not a bug: before
+re-uploading, `DriveUploader` reads the existing Drive file's `source_record_id` column and
+filters out anything already present, so re-synced rows that were already uploaded get silently
+dropped instead of duplicated. Verified directly: reinstalling and re-syncing on a real device
+added exactly the rows that were genuinely new since the last sync, zero duplicates.
+
 ## What this app does not and cannot sync
 
 Samsung's proprietary body-composition metrics (skeletal muscle mass, body fat %, BMI from the
@@ -104,12 +167,14 @@ work around this.
 
 ## Verifying it worked
 
-- Fresh install → pick owner → grant permissions → tap Sync → the CSV shows up in
+All of the below has actually been run end-to-end against a real phone and a real Drive
+folder, not just reasoned about — see commit history for what broke and got fixed along the
+way.
+
+- Fresh install → pick owner → import key → grant permissions → sync → the CSV shows up in
   `File Archive/Health/Wearable_Data/<Owner>_Samsung_Health_Sync.csv` with rows shaped like
-  `timestamp_utc,owner,metric,value,unit,source_record_id`.
+  `timestamp_utc,owner,metric,value,unit,source_record_id`, header included.
 - A second sync with no new Health Connect data appends nothing and doesn't error.
 - A second sync with new data appends only the new rows (cursor-based — see `SyncState.kt`).
-- Reinstalling and re-syncing doesn't duplicate old rows (the cursor persists per-install in
-  `SharedPreferences`, so a clean reinstall re-reads from Health Connect's retention window;
-  `source_record_id` is included in every row as a dedup backstop if you ever need to reconcile
-  the CSV by hand).
+- Reinstalling and re-syncing doesn't duplicate old rows — see "Reinstalling, or switching to a
+  differently-signed build" above for how that's guaranteed even with the cursor gone.
