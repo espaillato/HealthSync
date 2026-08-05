@@ -36,14 +36,31 @@
             android:name=".MainActivity"
             android:exported="false" />
 
-        <!-- Lets Health Connect deep-link into this app's permissions-usage screen -->
+        <!-- Lets Health Connect deep-link into this app's permissions-usage/rationale screen.
+             Two declarations are required, not one: Android <=13 (or standalone Health Connect
+             app on 26-33) resolves the plain ACTION_SHOW_PERMISSIONS_RATIONALE action; Android
+             14+ (system-integrated Health Connect, e.g. this device) instead requires an alias
+             with VIEW_PERMISSION_USAGE + the HEALTH_PERMISSIONS category and the special
+             START_VIEW_PERMISSION_USAGE permission. Without the second one, Health Connect's
+             own permission-request screen detects the app as misconfigured and immediately
+             closes itself with nothing granted, on Android 14+. -->
+        <activity-alias
+            android:name=".PermissionsRationaleActivity"
+            android:exported="true"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
+            </intent-filter>
+        </activity-alias>
+
         <activity-alias
             android:name=".ViewPermissionUsageActivity"
             android:exported="true"
             android:permission="android.permission.START_VIEW_PERMISSION_USAGE"
             android:targetActivity=".MainActivity">
             <intent-filter>
-                <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
+                <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
+                <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
             </intent-filter>
         </activity-alias>
 
