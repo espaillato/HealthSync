@@ -48,11 +48,20 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
             if (rows.isNotEmpty()) {
                 DriveUploader(applicationContext).appendRows(owner, rows, syncState)
             }
-            // Never move the cursor backward. Normally until is always >= the previous cursor,
-            // but right after upgrading from an older un-truncated cursor to this hour-aligned
-            // one, `until` can briefly land earlier than an existing mid-hour cursor -- writing
-            // that back would cause the next sync to re-read (and re-write) already-synced data.
-            if (since == null || until.isAfter(since)) {
+            // Only advance the cursor when a sync actually found something. Health Connect
+            // write sources can backfill *already-passed* timestamps -- e.g. Samsung Health,
+            // the moment it's first granted write access, wrote several hours of that day's
+            // heart-rate history retroactively. If the cursor had already advanced past that
+            // window (because an earlier sync ran before the backfill happened and legitimately
+            // found nothing), that data would become permanently unreachable: the cursor never
+            // looks backward. Leaving the cursor unmoved on an empty result costs nothing here
+            // (Health Connect reads are local, not network calls) and guarantees a late backfill
+            // into a previously-empty window still gets picked up on the next sync. Never move
+            // the cursor backward either way -- right after upgrading from an older un-truncated
+            // cursor to this hour-aligned one, `until` can briefly land earlier than an existing
+            // mid-hour cursor, and writing that back would cause the next sync to re-read
+            // already-synced data.
+            if (rows.isNotEmpty() && (since == null || until.isAfter(since))) {
                 syncState.lastSyncCursor = until
             }
             syncState.lastSyncTimestamp = until
