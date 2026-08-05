@@ -1,6 +1,9 @@
 package com.espaillat.healthsync
 
+import android.net.Uri
 import android.os.Bundle
+import android.view.View
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.health.connect.client.PermissionController
 import androidx.lifecycle.lifecycleScope
@@ -8,6 +11,8 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.espaillat.healthsync.databinding.ActivityMainBinding
 import kotlinx.coroutines.launch
+import java.io.File
+import java.io.IOException
 
 /** The app's only real screen: Sync Now button, last-synced timestamp, status line. */
 class MainActivity : AppCompatActivity() {
@@ -15,6 +20,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var syncState: SyncState
     private lateinit var reader: HealthConnectReader
+    private lateinit var driveUploader: DriveUploader
 
     private val requestPermissions = registerForActivityResult(
         PermissionController.createRequestPermissionResultContract()
@@ -26,6 +32,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Release builds aren't debuggable, so `adb shell run-as ... cp` (the dev-workflow way of
+    // placing the service-account key) is blocked by the OS outright -- this is the real,
+    // user-facing way to get the key into app-private storage: pick the downloaded key file
+    // from wherever it landed on the phone (Downloads, an email attachment, etc.) and the app
+    // copies its bytes into its own storage via the returned content:// URI. Works identically
+    // whether the file's detected MIME type is application/json, text/plain, or something else
+    // a browser/email client guessed, so the filter here is deliberately permissive ("*/*")
+    // rather than risking hiding the very file the user is looking for.
+    private val importKey = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importServiceAccountKey(uri)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -33,8 +51,10 @@ class MainActivity : AppCompatActivity() {
 
         syncState = SyncState(this)
         reader = HealthConnectReader(this)
+        driveUploader = DriveUploader(this)
 
         binding.buttonSyncNow.setOnClickListener { onSyncNowClicked(auto = false) }
+        binding.buttonImportKey.setOnClickListener { importKey.launch(arrayOf("*/*")) }
 
         // Registers (or refreshes) the once-a-day background sync. Idempotent — safe to call
         // on every launch, see SyncWorker.schedulePeriodicSync.
@@ -49,6 +69,19 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         refreshUi()
         onSyncNowClicked(auto = true)
+    }
+
+    private fun importServiceAccountKey(uri: Uri) {
+        try {
+            val destination = File(filesDir, DriveUploader.SERVICE_ACCOUNT_KEY_FILENAME)
+            val opened = contentResolver.openInputStream(uri)
+                ?: throw IOException("Could not open the selected file")
+            opened.use { input -> destination.outputStream().use { output -> input.copyTo(output) } }
+            refreshUi()
+            onSyncNowClicked(auto = false)
+        } catch (e: Exception) {
+            binding.textStatus.text = getString(R.string.status_key_import_failed, e.message ?: e.javaClass.simpleName)
+        }
     }
 
     private fun onSyncNowClicked(auto: Boolean) {
@@ -93,5 +126,7 @@ class MainActivity : AppCompatActivity() {
             SyncStatus.ERROR -> getString(R.string.status_error, syncState.lastSyncError ?: "")
             SyncStatus.NEVER -> getString(R.string.status_never_synced)
         }
+
+        binding.buttonImportKey.visibility = if (driveUploader.hasServiceAccountKey()) View.GONE else View.VISIBLE
     }
 }

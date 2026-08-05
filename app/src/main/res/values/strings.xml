@@ -6,6 +6,8 @@
     <string name="owner_max">Max</string>
 
     <string name="button_sync_now">Sync Now</string>
+    <string name="button_import_key">Import Drive Key</string>
+    <string name="status_key_import_failed">Couldn\'t import key: %1$s</string>
     <string name="label_owner">Owner: %1$s</string>
     <string name="label_last_sync">Last synced: %1$s</string>
     <string name="label_last_sync_never">Last synced: never</string>

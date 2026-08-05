@@ -46,4 +46,18 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Placed last / below everything else so toggling its visibility (gone once a key has
+         been imported) never shifts the position of button_sync_now or anything above it. -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/button_import_key"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="@string/button_import_key"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/text_status"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>
