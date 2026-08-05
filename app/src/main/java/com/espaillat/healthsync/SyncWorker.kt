@@ -38,17 +38,23 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         val since = syncState.lastSyncCursor
         // Truncated to the hour so a heart-rate bucket (see HealthConnectReader.readHeartRate)
         // never gets split across two sync runs -- each hour is only ever aggregated once, by
-        // whichever sync first reads past its end. Clamped to be no earlier than the cursor in
-        // case an old, un-truncated cursor from before this change is still ahead of it.
-        val truncatedNow = Instant.now().truncatedTo(ChronoUnit.HOURS)
-        val until = if (since != null && since.isAfter(truncatedNow)) since else truncatedNow
+        // whichever sync first reads past its end. If since is still ahead of this (e.g. two
+        // syncs within the same hour), HealthConnectReader.readSince short-circuits to empty
+        // rather than querying Health Connect with degenerate bounds.
+        val until = Instant.now().truncatedTo(ChronoUnit.HOURS)
 
         return try {
             val rows = reader.readSince(since, until, owner.label)
             if (rows.isNotEmpty()) {
                 DriveUploader(applicationContext).appendRows(owner, rows, syncState)
             }
-            syncState.lastSyncCursor = until
+            // Never move the cursor backward. Normally until is always >= the previous cursor,
+            // but right after upgrading from an older un-truncated cursor to this hour-aligned
+            // one, `until` can briefly land earlier than an existing mid-hour cursor -- writing
+            // that back would cause the next sync to re-read (and re-write) already-synced data.
+            if (since == null || until.isAfter(since)) {
+                syncState.lastSyncCursor = until
+            }
             syncState.lastSyncTimestamp = until
             syncState.lastSyncStatus = SyncStatus.SUCCESS
             syncState.lastSyncError = null

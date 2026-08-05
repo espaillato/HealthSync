@@ -56,6 +56,13 @@ class HealthConnectReader(private val context: Context) {
      * null) up to [until], flattened into CSV rows tagged with [owner].
      */
     suspend fun readSince(since: Instant?, until: Instant, owner: String): List<CsvRow> {
+        // Health Connect's TimeRangeFilter requires a strictly-after end time -- since == until
+        // is not just "empty", it's rejected outright. That happens legitimately whenever a
+        // sync runs again within the same hour as the last one (e.g. a manual "Sync Now" right
+        // after the nightly sync already advanced the cursor to this hour's boundary): there's
+        // nothing new to read yet, so skip Health Connect entirely rather than querying it with
+        // degenerate bounds.
+        if (since != null && !since.isBefore(until)) return emptyList()
         val range = TimeRangeFilter.between(since ?: Instant.EPOCH, until)
         val rows = mutableListOf<CsvRow>()
         rows += readSteps(range, owner)
