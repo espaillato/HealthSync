@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">HealthSync</string>
+
+    <string name="owner_picker_title">Whose phone is this?</string>
+    <string name="owner_ozzy">Ozzy</string>
+    <string name="owner_max">Max</string>
+
+    <string name="button_sync_now">Sync Now</string>
+    <string name="label_owner">Owner: %1$s</string>
+    <string name="label_last_sync">Last synced: %1$s</string>
+    <string name="label_last_sync_never">Last synced: never</string>
+
+    <string name="status_never_synced">Not synced yet</string>
+    <string name="status_success">Last sync succeeded</string>
+    <string name="status_error">Last sync failed: %1$s</string>
+    <string name="status_syncing">Syncing…</string>
+    <string name="status_permissions_needed">Health Connect permissions needed — tap Sync Now</string>
+    <string name="status_health_connect_unavailable">Health Connect isn\'t available on this device</string>
+
+    <string name="widget_label">HealthSync</string>
+    <string name="widget_subtitle">Tap to open</string>
+</resources>
