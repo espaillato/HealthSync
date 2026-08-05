@@ -1,6 +1,7 @@
 package com.espaillat.healthsync
 
 import android.content.Context
+import com.google.api.client.googleapis.json.GoogleJsonResponseException
 import com.google.api.client.http.ByteArrayContent
 import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.gson.GsonFactory
@@ -68,14 +69,31 @@ class DriveUploader(private val context: Context) {
 
         if (fileId == null) {
             val content = "${CsvRow.HEADER}\n$newLines\n"
-            val created = drive.files().create(
-                DriveFile().apply {
-                    name = fileName
-                    parents = listOf(folderId)
-                    mimeType = "text/csv"
-                },
-                ByteArrayContent("text/csv", content.toByteArray(Charsets.UTF_8))
-            ).setFields("id").execute()
+            val created = try {
+                drive.files().create(
+                    DriveFile().apply {
+                        name = fileName
+                        parents = listOf(folderId)
+                        mimeType = "text/csv"
+                    },
+                    ByteArrayContent("text/csv", content.toByteArray(Charsets.UTF_8))
+                ).setFields("id").execute()
+            } catch (e: GoogleJsonResponseException) {
+                if (e.details?.errors.orEmpty().any { it.reason == "storageQuotaExceeded" }) {
+                    throw DriveUploaderException(
+                        "Drive rejected creating '$fileName': service accounts have no " +
+                            "storage quota of their own, so they can't create a brand-new " +
+                            "file even in a folder shared with them as Editor. One-time " +
+                            "fix: create an empty file named exactly '$fileName' yourself " +
+                            "(signed in as your own Google account) inside Wearable_Data. " +
+                            "After that it already exists, so every sync only updates it " +
+                            "instead of creating it, which works fine for a service " +
+                            "account. See README step 0.",
+                        e
+                    )
+                }
+                throw e
+            }
             syncState.driveFileId = created.id
         } else {
             val existing = drive.files().get(fileId).executeMediaAsInputStream()

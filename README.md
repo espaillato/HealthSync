@@ -31,7 +31,18 @@ will succeed silently and land in the service account's own invisible Drive inst
    (right-click the folder → Share). This is the step that makes the shared folder visible
    to the app — without it, nothing will appear in your Drive even if the app reports success.
 
-4. **Push the key onto each phone**, into the app's private storage (requires USB debugging
+4. **Create empty placeholder files yourself** — as your own Google account, inside
+   `Wearable_Data` — named exactly `Ozzy_Samsung_Health_Sync.csv` and
+   `Max_Samsung_Health_Sync.csv`. This step is easy to skip and the app will look like it's
+   working right up until it isn't: **service accounts have no storage quota of their own**,
+   so they can create files inside a folder shared with them as Editor — Drive rejects it
+   with a `storageQuotaExceeded` 403, even though Editor access clearly allows writing. They
+   *can*, however, update a file that already exists, since that storage is charged to the
+   file's real owner (you), not to whoever's writing to it. Pre-creating empty files sidesteps
+   the whole problem: every sync from then on only ever updates, never creates. (The app
+   surfaces this exact explanation in its status line if you hit it before reading this.)
+
+5. **Push the key onto each phone**, into the app's private storage (requires USB debugging
    enabled and `adb` installed — this only needs to happen once per phone, after the app is
    first installed):
 
