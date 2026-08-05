@@ -15,6 +15,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalTime
 import java.time.ZonedDateTime
+import java.time.temporal.ChronoUnit
 import java.util.concurrent.TimeUnit
 
 /** WorkManager worker: HealthConnectReader -> DriveUploader, cursor only advances on success. */
@@ -35,7 +36,12 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         }
 
         val since = syncState.lastSyncCursor
-        val until = Instant.now()
+        // Truncated to the hour so a heart-rate bucket (see HealthConnectReader.readHeartRate)
+        // never gets split across two sync runs -- each hour is only ever aggregated once, by
+        // whichever sync first reads past its end. Clamped to be no earlier than the cursor in
+        // case an old, un-truncated cursor from before this change is still ahead of it.
+        val truncatedNow = Instant.now().truncatedTo(ChronoUnit.HOURS)
+        val until = if (since != null && since.isAfter(truncatedNow)) since else truncatedNow
 
         return try {
             val rows = reader.readSince(since, until, owner.label)

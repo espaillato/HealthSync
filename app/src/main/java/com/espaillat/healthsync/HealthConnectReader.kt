@@ -13,6 +13,8 @@ import androidx.health.connect.client.time.TimeRangeFilter
 import java.time.Duration
 import java.time.Instant
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.util.Locale
 import kotlin.reflect.KClass
 
 /** One row of the target CSV: timestamp_utc,owner,metric,value,unit,source_record_id */
@@ -88,19 +90,36 @@ class HealthConnectReader(private val context: Context) {
             )
         }
 
-    private suspend fun readHeartRate(range: TimeRangeFilter, owner: String): List<CsvRow> =
-        readAllPages(HeartRateRecord::class, range).flatMap { r ->
-            r.samples.map { sample ->
+    /**
+     * Continuous heart-rate sampling is dense enough (one sample every ~20-30s on a Galaxy
+     * Watch) that writing one CSV row per raw sample would produce ~100k rows/month from HR
+     * alone -- by far the dominant driver of file growth, confirmed against a real 30-day
+     * backfill. Bucketing into hourly min/avg/max keeps the same six-column schema and cuts
+     * that by roughly 45x. Buckets are UTC-hour aligned (not per-owner local time) so the
+     * result is deterministic regardless of the phone's timezone.
+     *
+     * SyncWorker truncates `until` down to the current hour boundary before calling this, so
+     * a bucket's samples are never split across two sync runs -- each hour is aggregated
+     * exactly once, from whichever sync run first reads records past its end.
+     */
+    private suspend fun readHeartRate(range: TimeRangeFilter, owner: String): List<CsvRow> {
+        val samplesByHour = readAllPages(HeartRateRecord::class, range)
+            .flatMap { it.samples }
+            .groupBy { it.time.truncatedTo(ChronoUnit.HOURS) }
+
+        return samplesByHour.entries.sortedBy { it.key }.flatMap { (bucketStart, samples) ->
+            val bpms = samples.map { it.beatsPerMinute }
+            val bucketId = "hr_hourly_${bucketStart.epochSecond}"
+            listOf(
+                CsvRow(bucketStart, owner, "heart_rate_min", bpms.min().toString(), "bpm", "$bucketId#min"),
                 CsvRow(
-                    timestampUtc = sample.time,
-                    owner = owner,
-                    metric = "heart_rate",
-                    value = sample.beatsPerMinute.toString(),
-                    unit = "bpm",
-                    sourceRecordId = "${r.metadata.id}#${sample.time.toEpochMilli()}",
-                )
-            }
+                    bucketStart, owner, "heart_rate_avg",
+                    String.format(Locale.US, "%.1f", bpms.average()), "bpm", "$bucketId#avg"
+                ),
+                CsvRow(bucketStart, owner, "heart_rate_max", bpms.max().toString(), "bpm", "$bucketId#max"),
+            )
         }
+    }
 
     private suspend fun readSleep(range: TimeRangeFilter, owner: String): List<CsvRow> {
         val rows = mutableListOf<CsvRow>()
