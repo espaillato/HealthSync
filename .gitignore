@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Secrets — never commit the Drive service-account key
+*service_account*.json
+*service-account*.json
+service_account_key.json
