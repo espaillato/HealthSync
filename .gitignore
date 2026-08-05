@@ -10,10 +10,14 @@ captures/
 *.apk
 *.aab
 
-# Secrets — never commit the Drive service-account key
+# Secrets — never commit the Drive service-account key.
+# GCP-downloaded key files are named "<project-id>-<hash>.json", not "*service_account*" --
+# the name-based globs below aren't reliable alone, so also ignore any project-root JSON file
+# that isn't a known non-secret one.
 *service_account*.json
 *service-account*.json
 service_account_key.json
+health-sync-*.json
 
 # Secrets — never commit the release signing keystore or its passwords
 *.jks
