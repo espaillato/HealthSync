@@ -65,9 +65,9 @@ class DriveUploader(private val context: Context) {
 
         val fileName = owner.fileName
         val fileId = resolveFileId(drive, folderId, fileName, syncState)
-        val newLines = rows.joinToString("\n") { it.toCsvLine() }
 
         if (fileId == null) {
+            val newLines = rows.joinToString("\n") { it.toCsvLine() }
             val content = "${CsvRow.HEADER}\n$newLines\n"
             val created = try {
                 drive.files().create(
@@ -104,6 +104,22 @@ class DriveUploader(private val context: Context) {
             // needs the header written here rather than relying on the files.create() branch,
             // which the standard flow never actually reaches.
             val base = existing.ifEmpty { "${CsvRow.HEADER}\n" }
+
+            // Backstop against duplicate rows if the local sync cursor was ever lost (app
+            // reinstall, cleared data, etc.) and a sync re-reads data already present in the
+            // file -- per the design doc's definition of done. source_record_id values are
+            // assumed comma-free (Health Connect UUIDs, or our own synthetic hr_hourly_* ids),
+            // so a cheap last-column extraction is enough without a full CSV parser.
+            val existingIds = base.lineSequence().drop(1)
+                .mapNotNullTo(mutableSetOf()) { it.substringAfterLast(',', "").ifEmpty { null } }
+            val newRows = rows.filterNot { it.sourceRecordId in existingIds }
+
+            if (newRows.isEmpty()) {
+                syncState.driveFileId = fileId
+                return
+            }
+
+            val newLines = newRows.joinToString("\n") { it.toCsvLine() }
             val separator = if (!base.endsWith("\n")) "\n" else ""
             val updated = "$base$separator$newLines\n"
             drive.files().update(fileId, null, ByteArrayContent("text/csv", updated.toByteArray(Charsets.UTF_8)))
