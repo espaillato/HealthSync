@@ -98,8 +98,14 @@ class DriveUploader(private val context: Context) {
         } else {
             val existing = drive.files().get(fileId).executeMediaAsInputStream()
                 .use { it.readBytes().toString(Charsets.UTF_8) }
-            val separator = if (existing.isNotEmpty() && !existing.endsWith("\n")) "\n" else ""
-            val updated = "$existing$separator$newLines\n"
+            // The documented setup flow (README step 0) always pre-creates this file empty,
+            // since a service account can't create it itself (storageQuotaExceeded above) --
+            // so an empty existing file is the normal first-sync case, not an edge case, and
+            // needs the header written here rather than relying on the files.create() branch,
+            // which the standard flow never actually reaches.
+            val base = existing.ifEmpty { "${CsvRow.HEADER}\n" }
+            val separator = if (!base.endsWith("\n")) "\n" else ""
+            val updated = "$base$separator$newLines\n"
             drive.files().update(fileId, null, ByteArrayContent("text/csv", updated.toByteArray(Charsets.UTF_8)))
                 .execute()
             syncState.driveFileId = fileId
