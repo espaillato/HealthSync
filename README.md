@@ -115,7 +115,11 @@ On first launch:
 
 1. Pick **Ozzy** or **Max** — this is a one-time, permanent choice per install (there's no way
    to change it later short of clearing app data, by design — see the design doc §2/§8).
-2. Grant the requested Health Connect permissions (steps, heart rate, sleep, exercise).
+2. Grant the requested Health Connect permissions — see "Metrics synced" below for the full
+   list. Health Connect shows this as two screens, not one: the main per-category grant, then
+   a second "Allow additional access" screen for two special permissions (access past data
+   beyond the normal 30-day-from-grant window, and access data in the background so the
+   nightly sync can actually read anything while the app isn't open) — grant both.
 3. The app syncs on launch and registers a background sync that runs **once a day, around
    2am local time** (`SyncWorker.schedulePeriodicSync`) — not on every widget refresh, to
    avoid battery drain from frequent background wakeups. You can also tap **Sync Now** any
@@ -156,14 +160,41 @@ filters out anything already present, so re-synced rows that were already upload
 dropped instead of duplicated. Verified directly: reinstalling and re-syncing on a real device
 added exactly the rows that were genuinely new since the last sync, zero duplicates.
 
-## What this app does not and cannot sync
+## Metrics synced
 
-Samsung's proprietary body-composition metrics (skeletal muscle mass, body fat %, BMI from the
-watch's BIA sensor) and the continuous stress score **do not pass through Health Connect** —
-they're cloud-only inside Samsung Health / Samsung Account and inaccessible to any third-party
-app, including this one. This is a Samsung platform restriction, not a gap in this app; keep
-exporting those manually. The app does not attempt to read Samsung Health's local database to
-work around this.
+Expanded well past the design doc's original four (steps, heart rate, sleep, exercise) —
+current rule: if Health Connect exposes it behind a plain read permission and it reduces to a
+scalar value per row, it's in; if it needs a real custom parser or an extra sensitive
+permission beyond the normal grant, it's out. See `HealthConnectReader.kt` for the exact
+mapping and reasoning inline.
+
+**Synced, one row per record (naturally low-frequency, no aggregation needed):** steps,
+distance, elevation gained, floors climbed, active calories burned, total calories burned,
+wheelchair pushes, hydration, resting heart rate, heart rate variability (RMSSD), oxygen
+saturation, respiratory rate, body temperature, basal body temperature, blood glucose, blood
+pressure (systolic + diastolic), VO2 max, weight, height, body fat %, bone mass, lean body
+mass, basal metabolic rate, sleep sessions + stages, exercise sessions.
+
+**Synced, hourly min/avg/max buckets** (dense continuous sampling — same reasoning as heart
+rate, see `Formatting.kt`/`HealthConnectReader.readAggregatedHourly`): heart rate, speed,
+power, cycling cadence, steps cadence.
+
+**Left out on purpose:**
+- **Samsung's proprietary body-composition metrics from the watch's BIA sensor** (skeletal
+  muscle mass, body fat % *as measured by the watch specifically*, BMI) **and the continuous
+  stress score** — these do not pass through Health Connect at all, cloud-only inside Samsung
+  Health / Samsung Account, a hard Samsung platform restriction with no workaround. Keep
+  exporting those manually. This is distinct from the `body_fat`/`weight`/etc. metrics above,
+  which read whatever *any* device writes through Health Connect's standard API (a smart scale,
+  for instance) — those work fine, the wall is specifically Samsung's sensor pipeline, not the
+  metric itself.
+- **Exercise GPS routes** — needs the separate, more sensitive `PERMISSION_READ_EXERCISE_ROUTES`
+  consent rather than a normal read grant.
+- **Full nutrition logging** — `NutritionRecord` has 30+ optional nutrient fields; doesn't
+  reduce to a scalar-per-row without real custom mapping code.
+- **Reproductive health** (menstruation, ovulation, sexual activity, etc.) — mechanically just
+  as easy to add as anything else here, but not applicable to this app's two named users, and
+  would bloat the permission consent screen with irrelevant categories.
 
 ## Verifying it worked
 
