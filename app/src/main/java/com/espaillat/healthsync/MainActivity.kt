@@ -8,9 +8,6 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.espaillat.healthsync.databinding.ActivityMainBinding
 import kotlinx.coroutines.launch
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 /** The app's only real screen: Sync Now button, last-synced timestamp, status line. */
 class MainActivity : AppCompatActivity() {
@@ -39,8 +36,12 @@ class MainActivity : AppCompatActivity() {
 
         binding.buttonSyncNow.setOnClickListener { onSyncNowClicked(auto = false) }
 
+        // Registers (or refreshes) the once-a-day background sync. Idempotent — safe to call
+        // on every launch, see SyncWorker.schedulePeriodicSync.
+        SyncWorker.schedulePeriodicSync(this)
+
         WorkManager.getInstance(this)
-            .getWorkInfosForUniqueWorkLiveData(SyncWorker.WORK_NAME)
+            .getWorkInfosForUniqueWorkLiveData(SyncWorker.MANUAL_WORK_NAME)
             .observe(this) { infos -> onWorkInfosChanged(infos) }
     }
 
@@ -82,7 +83,7 @@ class MainActivity : AppCompatActivity() {
 
         val lastSync = syncState.lastSyncTimestamp
         binding.textLastSync.text = if (lastSync != null) {
-            getString(R.string.label_last_sync, formatInstant(lastSync))
+            getString(R.string.label_last_sync, lastSync.toDisplayString())
         } else {
             getString(R.string.label_last_sync_never)
         }
@@ -93,9 +94,4 @@ class MainActivity : AppCompatActivity() {
             SyncStatus.NEVER -> getString(R.string.status_never_synced)
         }
     }
-
-    private fun formatInstant(instant: Instant): String =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
-            .withZone(ZoneId.systemDefault())
-            .format(instant)
 }

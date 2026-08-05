@@ -69,8 +69,14 @@ On first launch:
 1. Pick **Ozzy** or **Max** — this is a one-time, permanent choice per install (there's no way
    to change it later short of clearing app data, by design — see the design doc §2/§8).
 2. Grant the requested Health Connect permissions (steps, heart rate, sleep, exercise).
-3. The app syncs automatically. You can also tap **Sync Now** any time, and a home-screen
-   widget can trigger a sync on its own ~30-minute cycle if you place one.
+3. The app syncs on launch and registers a background sync that runs **once a day, around
+   2am local time** (`SyncWorker.schedulePeriodicSync`) — not on every widget refresh, to
+   avoid battery drain from frequent background wakeups. You can also tap **Sync Now** any
+   time for an immediate sync. A home-screen widget, if you place one, is a status display
+   only (last-synced time/error, tap to open) — it does not itself trigger a sync.
+
+   Once a day is already generous for step/HR/sleep/exercise data; if you'd rather sync every
+   2-3 days instead, bump `SYNC_INTERVAL_DAYS` in `SyncWorker.kt`.
 
 Each install writes to its own file — `Ozzy_Samsung_Health_Sync.csv` or
 `Max_Samsung_Health_Sync.csv` — inside the shared `Wearable_Data` folder, so the two datasets

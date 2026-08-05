@@ -19,4 +19,6 @@
 
     <string name="widget_label">HealthSync</string>
     <string name="widget_subtitle">Tap to open</string>
+    <string name="widget_last_sync">Synced %1$s</string>
+    <string name="widget_error">Last sync failed — tap to open</string>
 </resources>
