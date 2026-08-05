@@ -14,3 +14,8 @@ captures/
 *service_account*.json
 *service-account*.json
 service_account_key.json
+
+# Secrets — never commit the release signing keystore or its passwords
+*.jks
+*.keystore
+keystore.properties
