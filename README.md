@@ -168,16 +168,24 @@ scalar value per row, it's in; if it needs a real custom parser or an extra sens
 permission beyond the normal grant, it's out. See `HealthConnectReader.kt` for the exact
 mapping and reasoning inline.
 
-**Synced, one row per record (naturally low-frequency, no aggregation needed):** steps,
-distance, elevation gained, floors climbed, active calories burned, total calories burned,
-wheelchair pushes, hydration, resting heart rate, heart rate variability (RMSSD), oxygen
-saturation, respiratory rate, body temperature, basal body temperature, blood glucose, blood
-pressure (systolic + diastolic), VO2 max, weight, height, body fat %, bone mass, lean body
-mass, basal metabolic rate, sleep sessions + stages, exercise sessions.
+**Aggregated to one row per local day** (sums — steps, distance, elevation gained, floors
+climbed, active/total calories burned, wheelchair pushes, hydration, sleep session duration,
+sleep stage minutes, exercise minutes) — this is a trend-tracking file (weeks/months/years),
+not a live same-day dashboard, and per-record granularity for something like steps was ~80
+rows/day of noise for that purpose. Sleep specifically buckets **noon-to-noon, not
+midnight-to-midnight** (see `HealthConnectReader.sleepDayOf`) — a calendar-day boundary
+routinely splits or misattributes a single night's sleep since sessions normally cross
+midnight.
 
-**Synced, hourly min/avg/max buckets** (dense continuous sampling — same reasoning as heart
-rate, see `Formatting.kt`/`HealthConnectReader.readAggregatedHourly`): heart rate, speed,
-power, cycling cadence, steps cadence.
+**Aggregated to daily min/avg/max, three rows per local day** (fluctuating readings — heart
+rate, resting heart rate, HRV, oxygen saturation, respiratory rate, body/basal temperature,
+blood glucose, blood pressure, VO2 max, speed, power, cycling cadence, steps cadence).
+
+**Not aggregated — one row per record, point-in-time** (weight, height, body fat %, bone mass,
+lean body mass, basal metabolic rate) — a scale reading is a snapshot, not a rate to smooth
+over a day.
+
+A day (or sleep day) is only synced once it's actually over — see "Behavior note" below.
 
 **Left out on purpose:**
 - **Samsung's proprietary body-composition metrics from the watch's BIA sensor** (skeletal
@@ -195,6 +203,20 @@ power, cycling cadence, steps cadence.
 - **Reproductive health** (menstruation, ovulation, sexual activity, etc.) — mechanically just
   as easy to add as anything else here, but not applicable to this app's two named users, and
   would bloat the permission consent screen with irrelevant categories.
+
+### Behavior note: daily aggregation changes what "Sync Now" does
+
+A day can only be aggregated once it's over, so `SyncWorker`'s `until` boundary is "start of
+today, local time" — not "right now". A mid-day **Sync Now** tap will typically find nothing
+new until the next calendar day begins, since today's steps/heart-rate/etc. aren't a finished
+number yet. This pairs naturally with the existing ~2am nightly schedule (by then yesterday is
+long complete), but it does mean the button stops being useful for "see today's live total" —
+which matches this file's purpose (long-run trends) rather than live tracking, but is worth
+knowing going in.
+
+Timestamps on daily-aggregated rows use the local calendar date encoded as UTC midnight of that
+same date string — deliberately not a true timezone conversion, so `timestamp_utc`'s date
+portion always matches the day a human actually experienced rather than a UTC-shifted one.
 
 ## Verifying it worked
 
