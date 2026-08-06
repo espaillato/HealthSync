@@ -117,11 +117,15 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
 
         /**
          * Registers the recurring background sync (default: once a day, ~2pm, +/- a 1-hour flex
-         * window). Safe to call every app launch — [ExistingPeriodicWorkPolicy.UPDATE] keeps a
-         * single schedule alive and just refreshes its parameters in place rather than
-         * duplicating or resetting it. This is the only source of unattended background sync;
-         * it does not ride on the widget's update cycle, so battery impact is one network call
-         * a day, not one every 30 minutes.
+         * window). Safe to call every app launch. Uses [ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE],
+         * not UPDATE -- verified on a real device that UPDATE does not reliably re-anchor an
+         * already-scheduled periodic work to a freshly computed initial delay (the previous
+         * schedule, set up under this app's original 2am target, was still landing on
+         * roughly its old cadence after switching the constant to 2pm and calling UPDATE).
+         * CANCEL_AND_REENQUEUE guarantees the new target actually takes hold, at the cost of a
+         * narrow theoretical race if the app happens to be reopened at the exact moment the
+         * periodic worker is mid-execution (it would be cancelled and simply retried next cycle
+         * -- the cursor-safety logic already tolerates an interrupted/skipped sync gracefully).
          */
         fun schedulePeriodicSync(context: Context) {
             val request = PeriodicWorkRequestBuilder<SyncWorker>(
@@ -132,7 +136,7 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
                 .setConstraints(networkConstraints())
                 .build()
             WorkManager.getInstance(context)
-                .enqueueUniquePeriodicWork(PERIODIC_WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
+                .enqueueUniquePeriodicWork(PERIODIC_WORK_NAME, ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE, request)
         }
 
         private fun networkConstraints(): Constraints =
