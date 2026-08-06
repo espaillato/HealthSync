@@ -96,7 +96,6 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
          *  Once a day is already more than enough for step/HR/sleep/exercise data; bump this
          *  to 2-3 if even-less-frequent background syncing is preferred. */
         private const val SYNC_INTERVAL_DAYS = 1L
-        private const val FLEX_WINDOW_HOURS = 1L
         // Afternoon, not the middle of the night -- deliberately not "2am" despite that being
         // the obvious off-peak-battery choice. A calendar day is complete at midnight, but a
         // sleep day (noon-to-noon, see HealthConnectReader.sleepDayOf) isn't complete until
@@ -116,22 +115,31 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         }
 
         /**
-         * Registers the recurring background sync (default: once a day, ~2pm, +/- a 1-hour flex
-         * window). Safe to call every app launch. Uses [ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE],
-         * not UPDATE -- verified on a real device that UPDATE does not reliably re-anchor an
-         * already-scheduled periodic work to a freshly computed initial delay (the previous
-         * schedule, set up under this app's original 2am target, was still landing on
-         * roughly its old cadence after switching the constant to 2pm and calling UPDATE).
-         * CANCEL_AND_REENQUEUE guarantees the new target actually takes hold, at the cost of a
-         * narrow theoretical race if the app happens to be reopened at the exact moment the
-         * periodic worker is mid-execution (it would be cancelled and simply retried next cycle
-         * -- the cursor-safety logic already tolerates an interrupted/skipped sync gracefully).
+         * Registers the recurring background sync (default: once a day, ~2pm). Safe to call
+         * every app launch. Uses [ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE], not UPDATE --
+         * verified on a real device that UPDATE does not reliably re-anchor an already-scheduled
+         * periodic work to a freshly computed initial delay (the previous schedule, set up under
+         * this app's original 2am target, was still landing on roughly its old cadence after
+         * switching the constant to 2pm and calling UPDATE). CANCEL_AND_REENQUEUE guarantees the
+         * new target actually takes hold, at the cost of a narrow theoretical race if the app
+         * happens to be reopened at the exact moment the periodic worker is mid-execution (it
+         * would be cancelled and simply retried next cycle -- the cursor-safety logic already
+         * tolerates an interrupted/skipped sync gracefully).
+         *
+         * Deliberately NOT passing a flex window here (i.e. not using the
+         * (interval, intervalUnit, flex, flexUnit) constructor). That was tried and verified on
+         * a real device to backfire: WorkManager only lets a flex window narrow *where inside a
+         * period* a run can land, it does not let setInitialDelay skip ahead within that period --
+         * the first execution still waits out (interval - flex) beyond the initial delay, same as
+         * every later one. With a 1-hour flex on a 1-day interval that silently added ~23 extra
+         * hours to the very first run (observed: computed initial delay ~18h, actual
+         * "Minimum latency" in `dumpsys jobscheduler` ~41h -- 18h + (24h - 1h)). Omitting the
+         * flex makes the effective flex equal to the full interval, so the first run fires right
+         * at the initial delay as intended; the OS still has the entire day to batch/optimize
+         * exactly as it would with no flex requested at all.
          */
         fun schedulePeriodicSync(context: Context) {
-            val request = PeriodicWorkRequestBuilder<SyncWorker>(
-                SYNC_INTERVAL_DAYS, TimeUnit.DAYS,
-                FLEX_WINDOW_HOURS, TimeUnit.HOURS
-            )
+            val request = PeriodicWorkRequestBuilder<SyncWorker>(SYNC_INTERVAL_DAYS, TimeUnit.DAYS)
                 .setInitialDelay(millisUntilNextTargetHour(), TimeUnit.MILLISECONDS)
                 .setConstraints(networkConstraints())
                 .build()
