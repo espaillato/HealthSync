@@ -258,6 +258,18 @@ class HealthConnectReader(private val context: Context) {
     private fun localDayOf(instant: Instant): LocalDate = instant.atZone(ZoneId.systemDefault()).toLocalDate()
 
     /**
+     * Sleep sessions naturally span midnight (bedtime 11pm, wake 7am) -- bucketing them by
+     * calendar day like everything else would routinely split or misattribute a single night's
+     * sleep depending on which side of midnight bedtime happened to fall. Noon is used as the
+     * day boundary instead: a session ending anytime from noon one day to noon the next belongs
+     * to the earlier date's "sleep day", matching how people actually think about "last night's
+     * sleep" regardless of exact bedtime. Nobody is asleep at noon under a normal schedule, so
+     * that's a safe place to draw the line.
+     */
+    private fun sleepDayOf(instant: Instant): LocalDate =
+        instant.atZone(ZoneId.systemDefault()).minusHours(12).toLocalDate()
+
+    /**
      * A daily bucket's date, encoded as UTC midnight of that same date -- deliberately NOT a
      * true timezone conversion (that would shift the displayed date by the local UTC offset,
      * e.g. local midnight in KST becomes the previous day at 15:00 UTC). The point of daily
@@ -284,17 +296,17 @@ class HealthConnectReader(private val context: Context) {
     }
 
     /**
-     * Sleep sessions/stages summed per local day rather than one row per session or per stage
-     * segment -- a night's sleep normally alternates through several light/deep/REM/awake
-     * segments, which was by far the single densest metric in the file (confirmed against real
-     * data: ~35 `sleep_stage_light` rows/day alone) for no trend-relevant benefit over "total
-     * minutes of each stage that day".
+     * Sleep sessions/stages summed per sleep day (noon-to-noon, see [sleepDayOf]) rather than
+     * one row per session or per stage segment -- a night's sleep normally alternates through
+     * several light/deep/REM/awake segments, which was by far the single densest metric in the
+     * file (confirmed against real data: ~35 `sleep_stage_light` rows/day alone) for no
+     * trend-relevant benefit over "total minutes of each stage that sleep day".
      */
     private suspend fun readSleep(range: TimeRangeFilter, owner: String): List<CsvRow> {
         val sessions = readAllPages(SleepSessionRecord::class, range)
         val rows = mutableListOf<CsvRow>()
 
-        sessions.groupBy { localDayOf(it.endTime) }.forEach { (day, daySessions) ->
+        sessions.groupBy { sleepDayOf(it.endTime) }.forEach { (day, daySessions) ->
             val totalMinutes = daySessions.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
             rows += CsvRow(day.asTimestamp(), owner, "sleep_session_duration", totalMinutes.toString(), "minutes", "sleep_session_duration_daily_$day")
         }
@@ -302,7 +314,7 @@ class HealthConnectReader(private val context: Context) {
         val stageMinutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
         for (session in sessions) {
             for (stage in session.stages) {
-                val key = localDayOf(stage.endTime) to stageTypeName(stage.stage)
+                val key = sleepDayOf(stage.endTime) to stageTypeName(stage.stage)
                 val minutes = Duration.between(stage.startTime, stage.endTime).toMinutes()
                 stageMinutesByDayAndType.merge(key, minutes, Long::plus)
             }
