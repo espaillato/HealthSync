@@ -55,6 +55,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.buttonSyncNow.setOnClickListener { onSyncNowClicked(auto = false) }
         binding.buttonImportKey.setOnClickListener { importKey.launch(arrayOf("*/*")) }
+        binding.buttonResyncHistory.setOnClickListener { onResyncHistoryClicked() }
 
         // Registers (or refreshes) the once-a-day background sync. Idempotent — safe to call
         // on every launch, see SyncWorker.schedulePeriodicSync.
@@ -102,6 +103,31 @@ class MainActivity : AppCompatActivity() {
         SyncWorker.enqueue(this)
     }
 
+    /**
+     * Resets the cursor to null and re-syncs, so the next read starts from Health Connect's
+     * earliest retained data again instead of wherever the cursor happened to be. Needed
+     * whenever a newly-added metric type would otherwise only ever see data from the moment it
+     * was added onward: the cursor is shared across every metric, so it had already advanced
+     * past the new metric's entire history before that metric ever existed in the code. Safe to
+     * re-run anytime -- DriveUploader's source_record_id dedup backstop means already-uploaded
+     * days are silently skipped, not duplicated.
+     */
+    private fun onResyncHistoryClicked() {
+        if (!HealthConnectReader.isAvailable(this)) {
+            binding.textStatus.text = getString(R.string.status_health_connect_unavailable)
+            return
+        }
+        lifecycleScope.launch {
+            if (reader.hasAllPermissions()) {
+                syncState.lastSyncCursor = null
+                binding.textStatus.text = getString(R.string.status_resyncing_history)
+                triggerSync()
+            } else {
+                requestPermissions.launch(HealthConnectReader.REQUIRED_PERMISSIONS)
+            }
+        }
+    }
+
     private fun onWorkInfosChanged(infos: List<WorkInfo>) {
         val active = infos.any { !it.state.isFinished }
         if (active) {
@@ -119,6 +145,13 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.label_last_sync, lastSync.toDisplayString())
         } else {
             getString(R.string.label_last_sync_never)
+        }
+
+        val dataThrough = syncState.lastSyncCursor
+        binding.textDataThrough.text = if (dataThrough != null) {
+            getString(R.string.label_data_through, dataThrough.toDisplayString())
+        } else {
+            getString(R.string.label_data_through_none)
         }
 
         binding.textStatus.text = when (syncState.lastSyncStatus) {

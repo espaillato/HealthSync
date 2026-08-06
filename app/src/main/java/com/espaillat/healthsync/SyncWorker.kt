@@ -13,9 +13,7 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import java.time.Duration
 import java.time.Instant
-import java.time.LocalDate
 import java.time.LocalTime
-import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.util.concurrent.TimeUnit
 
@@ -37,20 +35,16 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         }
 
         val since = syncState.lastSyncCursor
-        // Truncated to the start of today (local time) so a daily bucket (see
-        // HealthConnectReader's readSumDaily/readStatsDaily/readAggregatedDaily) never gets
-        // split across two sync runs -- a day is only ever aggregated once it's actually over,
-        // by whichever sync first reads past its end. Concretely: this excludes all of today's
-        // still-accumulating data from every sync until tomorrow, when today becomes a complete
-        // past day. That's intentional, not a bug -- daily aggregates are for trend tracking
-        // (weeks/months/years), not a live same-day total, and it pairs naturally with the
-        // nightly ~2am schedule (by then yesterday is long since complete). If since is still
-        // ahead of this (e.g. two syncs on the same local day), HealthConnectReader.readSince
-        // short-circuits to empty rather than querying Health Connect with degenerate bounds.
-        val until = LocalDate.now(ZoneId.systemDefault()).atStartOfDay(ZoneId.systemDefault()).toInstant()
+        // Query as fresh as possible -- completeness (has today, or the current sleep day,
+        // actually finished?) is HealthConnectReader's job, not the query window's. See
+        // HealthConnectReader.readSince's doc for why those are deliberately separate: a
+        // calendar day and a sleep day (noon-to-noon) become "complete" at different wall-clock
+        // times, so narrowing the query window to one shared cutoff can't correctly serve both
+        // regardless of what that cutoff is.
+        val now = Instant.now()
 
         return try {
-            val rows = reader.readSince(since, until, owner.label)
+            val rows = reader.readSince(since, now, owner.label)
             if (rows.isNotEmpty()) {
                 DriveUploader(applicationContext).appendRows(owner, rows, syncState)
             }
@@ -62,15 +56,17 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
             // found nothing), that data would become permanently unreachable: the cursor never
             // looks backward. Leaving the cursor unmoved on an empty result costs nothing here
             // (Health Connect reads are local, not network calls) and guarantees a late backfill
-            // into a previously-empty window still gets picked up on the next sync. Never move
-            // the cursor backward either way -- right after upgrading from an older
-            // differently-truncated cursor to this one, `until` can briefly land earlier than an
-            // existing cursor, and writing that back would cause the next sync to re-read
-            // already-synced data.
-            if (rows.isNotEmpty() && (since == null || until.isAfter(since))) {
-                syncState.lastSyncCursor = until
+            // into a previously-empty window still gets picked up on the next sync.
+            //
+            // The cursor advances to safeCursorBoundary(), not to `now` -- never past a point
+            // that could still receive more data for some metric. Never move it backward either
+            // way, in case a prior cursor (from before this boundary logic existed) is somehow
+            // already ahead of it.
+            val safeBoundary = reader.safeCursorBoundary()
+            if (rows.isNotEmpty() && (since == null || safeBoundary.isAfter(since))) {
+                syncState.lastSyncCursor = safeBoundary
             }
-            syncState.lastSyncTimestamp = until
+            syncState.lastSyncTimestamp = now
             syncState.lastSyncStatus = SyncStatus.SUCCESS
             syncState.lastSyncError = null
             Result.success(workDataOf(KEY_ROWS_SYNCED to rows.size))
@@ -90,7 +86,7 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         /** Unique name for on-demand syncs (app launch, manual "Sync Now" tap). */
         const val MANUAL_WORK_NAME = "health_sync_manual_work"
 
-        /** Unique name for the nightly background schedule (see [schedulePeriodicSync]). */
+        /** Unique name for the once-a-day background schedule (see [schedulePeriodicSync]). */
         const val PERIODIC_WORK_NAME = "health_sync_periodic_work"
 
         const val KEY_ERROR = "error"
@@ -101,7 +97,14 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
          *  to 2-3 if even-less-frequent background syncing is preferred. */
         private const val SYNC_INTERVAL_DAYS = 1L
         private const val FLEX_WINDOW_HOURS = 1L
-        private const val TARGET_HOUR_OF_DAY = 2 // run around 2am local time, not mid-battery-use
+        // Afternoon, not the middle of the night -- deliberately not "2am" despite that being
+        // the obvious off-peak-battery choice. A calendar day is complete at midnight, but a
+        // sleep day (noon-to-noon, see HealthConnectReader.sleepDayOf) isn't complete until
+        // noon the *next* day, so a 2am run can never see last night's sleep as complete: it's
+        // structurally always ~1-2 days stale for sleep specifically, no matter how many times a
+        // day it runs, since the boundary itself hasn't been crossed yet. One run shortly after
+        // noon covers both boundaries in a single sync instead of needing two schedules.
+        private const val TARGET_HOUR_OF_DAY = 14
 
         /** Enqueues a one-off sync, joining any already-pending/running one rather than stacking up. */
         fun enqueue(context: Context) {
@@ -113,7 +116,7 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         }
 
         /**
-         * Registers the recurring background sync (default: nightly, ~2am, +/- a 1-hour flex
+         * Registers the recurring background sync (default: once a day, ~2pm, +/- a 1-hour flex
          * window). Safe to call every app launch — [ExistingPeriodicWorkPolicy.UPDATE] keeps a
          * single schedule alive and just refreshes its parameters in place rather than
          * duplicating or resetting it. This is the only source of unattended background sync;

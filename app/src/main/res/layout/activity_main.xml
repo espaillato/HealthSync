@@ -15,12 +15,25 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Wall-clock time of the last sync attempt (success or failure), distinct from
+         text_data_through below, specifically so it's possible to tell "did a sync just run at
+         all" apart from "how fresh is the data", which used to be conflated into one timestamp
+         that barely moved day to day (it showed the data cutoff, not the attempt time). -->
     <TextView
         android:id="@+id/text_last_sync"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
         app:layout_constraintTop_toBottomOf="@id/text_owner"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <TextView
+        android:id="@+id/text_data_through"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        app:layout_constraintTop_toBottomOf="@id/text_last_sync"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
@@ -32,7 +45,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="24dp"
         android:text="@string/button_sync_now"
-        app:layout_constraintTop_toBottomOf="@id/text_last_sync"
+        app:layout_constraintTop_toBottomOf="@id/text_data_through"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
@@ -57,6 +70,24 @@
         android:text="@string/button_import_key"
         android:visibility="gone"
         app:layout_constraintTop_toBottomOf="@id/text_status"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Resets the sync cursor and re-reads everything Health Connect currently retains, safe
+         thanks to the source_record_id dedup backstop in DriveUploader (already-synced days
+         just get filtered out, nothing duplicates). Needed after adding a new metric type: the
+         shared cursor had already advanced past that metric's whole history from whatever was
+         already being tracked, so newly-added metrics otherwise only ever see data from the
+         moment they were added onward, silently missing everything Health Connect still has
+         from before that. -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/button_resync_history"
+        style="@style/Widget.MaterialComponents.Button.TextButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/button_resync_history"
+        app:layout_constraintTop_toBottomOf="@id/button_import_key"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 

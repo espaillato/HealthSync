@@ -84,10 +84,22 @@ data class CsvRow(
  * Everything except point-in-time body measurements (weight, height, body fat, bone mass, lean
  * body mass, basal metabolic rate) is aggregated to one local calendar day per row -- sums for
  * additive metrics (steps, distance, calories, sleep-stage minutes, exercise minutes, ...), and
- * min/avg/max for fluctuating ones (heart rate, blood pressure, speed/power/cadence, ...). This
- * is for long-run trend tracking (weeks/months/years), not live same-day monitoring: per-record
- * granularity for something like steps produced ~80 rows/day, almost all of it noise for that
- * purpose. A day is only aggregated once it's over -- see SyncWorker's `until` computation.
+ * min/avg/max for fluctuating ones (heart rate, blood pressure, speed/power/cadence, ...). Sleep
+ * specifically buckets by a noon-to-noon "sleep day" instead (see [sleepDayOf]) -- sessions
+ * normally cross midnight, so calendar-day bucketing would routinely split or misattribute a
+ * single night's sleep. This is all for long-run trend tracking (weeks/months/years), not live
+ * same-day monitoring: per-record granularity for something like steps produced ~80 rows/day,
+ * almost all of it noise for that purpose.
+ *
+ * A day (or sleep day) is only ever aggregated into an output row once it's actually complete --
+ * see [isCompleteCalendarDay]/[isCompleteSleepDay]. This is checked independently of how far the
+ * query itself reads (always up to `until`, typically "now"): querying fresh but filtering
+ * incomplete buckets out afterward, rather than narrowing the query window, is what lets a sync
+ * running at any time of day correctly pick up whatever has newly become complete since the last
+ * one. That distinction matters because "complete" means different things for different metrics
+ * -- a calendar day is done at midnight, but a sleep day isn't done until noon the next day, so a
+ * sync that ran right after midnight and one that ran mid-afternoon need to agree on what's safe
+ * to emit without needing two different query windows to get there.
  */
 class HealthConnectReader(private val context: Context) {
 
@@ -97,15 +109,39 @@ class HealthConnectReader(private val context: Context) {
         client.permissionController.getGrantedPermissions().containsAll(REQUIRED_PERMISSIONS)
 
     /**
+     * The most recent instant it's safe to advance the sync cursor to: the more conservative of
+     * "start of today" (the boundary for every calendar-day-bucketed metric) and "start of the
+     * current, still-in-progress sleep day" (noon-to-noon, see [sleepDayOf]). Always safe to use
+     * as a cursor -- never past a boundary that could still receive more data -- but sometimes
+     * more conservative than strictly necessary (e.g. calendar-day metrics could technically
+     * advance further before noon, when sleep is the binding constraint). The cost of that slack
+     * is a bit of redundant local re-scanning on the next sync, which the dedup backstop in
+     * DriveUploader makes harmless; the alternative would be a separate cursor per metric type,
+     * not worth the complexity for what this saves.
+     */
+    fun safeCursorBoundary(): Instant {
+        val zone = ZoneId.systemDefault()
+        val todayStart = LocalDate.now(zone).atStartOfDay(zone).toInstant()
+        val currentSleepDayStart = sleepDayOf(Instant.now()).atTime(12, 0).atZone(zone).toInstant()
+        return minOf(todayStart, currentSleepDayStart)
+    }
+
+    /**
      * Reads all in-scope records with an end time after [since] (or all retained history if
-     * null) up to [until], flattened into CSV rows tagged with [owner].
+     * null) up to [until], flattened into CSV rows tagged with [owner]. Queries as fresh as
+     * [until] allows, but only ever emits rows for days (or sleep days) that are actually
+     * complete as of *now* -- a still-forming today's/current-sleep-day's data gets read from
+     * Health Connect same as anything else, then silently dropped before aggregation, rather
+     * than excluded by narrowing the query window. That split matters: it's what lets a sync
+     * running at any time of day correctly pick up whatever has newly become complete since the
+     * last one, without needing the query window and the completeness boundary to be the same
+     * thing (they aren't, for sleep -- see [sleepDayOf]).
      */
     suspend fun readSince(since: Instant?, until: Instant, owner: String): List<CsvRow> {
         // Health Connect's TimeRangeFilter requires a strictly-after end time -- since == until
-        // is not just "empty", it's rejected outright. That happens legitimately whenever a
-        // sync runs again on the same local calendar day as the last one (e.g. a manual "Sync
-        // Now" after the nightly sync already advanced the cursor to today's start): there's
-        // nothing new to read yet, since today itself isn't a complete day to aggregate.
+        // is not just "empty", it's rejected outright. Guards the degenerate case (e.g. two
+        // syncs firing back to back); in practice `since` is always some past cursor and `until`
+        // is the current instant, so this rarely trips.
         if (since != null && !since.isBefore(until)) return emptyList()
         val range = TimeRangeFilter.between(since ?: Instant.EPOCH, until)
         val rows = mutableListOf<CsvRow>()
@@ -201,7 +237,7 @@ class HealthConnectReader(private val context: Context) {
         value: (T) -> Double,
     ): List<CsvRow> {
         val byDay = readAllPages(recordType, range).groupBy { localDayOf(endTime(it)) }
-        return byDay.entries.sortedBy { it.key }.map { (day, records) ->
+        return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.map { (day, records) ->
             val total = records.sumOf(value)
             CsvRow(day.asTimestamp(), owner, metric, formatSum(total, asCount), unit, "${metric}_daily_$day")
         }
@@ -218,7 +254,7 @@ class HealthConnectReader(private val context: Context) {
         value: (T) -> Double,
     ): List<CsvRow> {
         val byDay = readAllPages(recordType, range).groupBy { localDayOf(time(it)) }
-        return byDay.entries.sortedBy { it.key }.flatMap { (day, records) ->
+        return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.flatMap { (day, records) ->
             dailyMinAvgMaxRows(day, owner, metricPrefix, unit, records.map(value))
         }
     }
@@ -239,7 +275,7 @@ class HealthConnectReader(private val context: Context) {
         val byDay = readAllPages(recordType, range)
             .flatMap(samplesOf)
             .groupBy { localDayOf(it.first) }
-        return byDay.entries.sortedBy { it.key }.flatMap { (day, samples) ->
+        return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.flatMap { (day, samples) ->
             dailyMinAvgMaxRows(day, owner, metricPrefix, unit, samples.map { it.second })
         }
     }
@@ -256,6 +292,14 @@ class HealthConnectReader(private val context: Context) {
 
     /** The phone's local calendar date for an instant -- the day a human actually experienced. */
     private fun localDayOf(instant: Instant): LocalDate = instant.atZone(ZoneId.systemDefault()).toLocalDate()
+
+    /** True once [day] can no longer receive more data -- strictly before today. */
+    private fun isCompleteCalendarDay(day: LocalDate): Boolean =
+        day.isBefore(LocalDate.now(ZoneId.systemDefault()))
+
+    /** True once [day]'s sleep day (noon-to-noon) can no longer receive more data. */
+    private fun isCompleteSleepDay(day: LocalDate): Boolean =
+        day.isBefore(sleepDayOf(Instant.now()))
 
     /**
      * Sleep sessions naturally span midnight (bedtime 11pm, wake 7am) -- bucketing them by
@@ -288,10 +332,12 @@ class HealthConnectReader(private val context: Context) {
     private suspend fun readBloodPressure(range: TimeRangeFilter, owner: String): List<CsvRow> {
         val records = readAllPages(BloodPressureRecord::class, range)
         val rows = mutableListOf<CsvRow>()
-        records.groupBy { localDayOf(it.time) }.forEach { (day, dayRecords) ->
-            rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_systolic", "mmHg", dayRecords.map { it.systolic.inMillimetersOfMercury })
-            rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_diastolic", "mmHg", dayRecords.map { it.diastolic.inMillimetersOfMercury })
-        }
+        records.groupBy { localDayOf(it.time) }
+            .filterKeys { isCompleteCalendarDay(it) }
+            .forEach { (day, dayRecords) ->
+                rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_systolic", "mmHg", dayRecords.map { it.systolic.inMillimetersOfMercury })
+                rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_diastolic", "mmHg", dayRecords.map { it.diastolic.inMillimetersOfMercury })
+            }
         return rows
     }
 
@@ -306,15 +352,19 @@ class HealthConnectReader(private val context: Context) {
         val sessions = readAllPages(SleepSessionRecord::class, range)
         val rows = mutableListOf<CsvRow>()
 
-        sessions.groupBy { sleepDayOf(it.endTime) }.forEach { (day, daySessions) ->
-            val totalMinutes = daySessions.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
-            rows += CsvRow(day.asTimestamp(), owner, "sleep_session_duration", totalMinutes.toString(), "minutes", "sleep_session_duration_daily_$day")
-        }
+        sessions.groupBy { sleepDayOf(it.endTime) }
+            .filterKeys { isCompleteSleepDay(it) }
+            .forEach { (day, daySessions) ->
+                val totalMinutes = daySessions.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
+                rows += CsvRow(day.asTimestamp(), owner, "sleep_session_duration", totalMinutes.toString(), "minutes", "sleep_session_duration_daily_$day")
+            }
 
         val stageMinutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
         for (session in sessions) {
             for (stage in session.stages) {
-                val key = sleepDayOf(stage.endTime) to stageTypeName(stage.stage)
+                val day = sleepDayOf(stage.endTime)
+                if (!isCompleteSleepDay(day)) continue
+                val key = day to stageTypeName(stage.stage)
                 val minutes = Duration.between(stage.startTime, stage.endTime).toMinutes()
                 stageMinutesByDayAndType.merge(key, minutes, Long::plus)
             }
@@ -342,7 +392,9 @@ class HealthConnectReader(private val context: Context) {
     private suspend fun readExercise(range: TimeRangeFilter, owner: String): List<CsvRow> {
         val minutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
         for (r in readAllPages(ExerciseSessionRecord::class, range)) {
-            val key = localDayOf(r.endTime) to exerciseTypeName(r.exerciseType)
+            val day = localDayOf(r.endTime)
+            if (!isCompleteCalendarDay(day)) continue
+            val key = day to exerciseTypeName(r.exerciseType)
             val minutes = Duration.between(r.startTime, r.endTime).toMinutes()
             minutesByDayAndType.merge(key, minutes, Long::plus)
         }

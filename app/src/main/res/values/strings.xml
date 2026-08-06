@@ -7,10 +7,14 @@
 
     <string name="button_sync_now">Sync Now</string>
     <string name="button_import_key">Import Drive Key</string>
+    <string name="button_resync_history">Resync Full History</string>
     <string name="status_key_import_failed">Couldn\'t import key: %1$s</string>
+    <string name="status_resyncing_history">Resyncing full history…</string>
     <string name="label_owner">Owner: %1$s</string>
-    <string name="label_last_sync">Last synced: %1$s</string>
-    <string name="label_last_sync_never">Last synced: never</string>
+    <string name="label_last_sync">Last sync attempt: %1$s</string>
+    <string name="label_last_sync_never">Last sync attempt: never</string>
+    <string name="label_data_through">Data through: %1$s</string>
+    <string name="label_data_through_none">Data through: nothing synced yet</string>
 
     <string name="status_never_synced">Not synced yet</string>
     <string name="status_success">Last sync succeeded</string>
