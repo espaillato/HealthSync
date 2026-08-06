@@ -38,8 +38,10 @@ import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
-import java.time.temporal.ChronoUnit
 import java.util.Locale
 import kotlin.reflect.KClass
 
@@ -78,6 +80,14 @@ data class CsvRow(
  * fields), and the reproductive-health category (Menstruation, Ovulation, SexualActivity, and
  * similar record types) -- mechanically trivial, but not applicable to this app's two named
  * users and would otherwise bloat the permission consent screen with irrelevant categories.
+ *
+ * Everything except point-in-time body measurements (weight, height, body fat, bone mass, lean
+ * body mass, basal metabolic rate) is aggregated to one local calendar day per row -- sums for
+ * additive metrics (steps, distance, calories, sleep-stage minutes, exercise minutes, ...), and
+ * min/avg/max for fluctuating ones (heart rate, blood pressure, speed/power/cadence, ...). This
+ * is for long-run trend tracking (weeks/months/years), not live same-day monitoring: per-record
+ * granularity for something like steps produced ~80 rows/day, almost all of it noise for that
+ * purpose. A day is only aggregated once it's over -- see SyncWorker's `until` computation.
  */
 class HealthConnectReader(private val context: Context) {
 
@@ -93,41 +103,41 @@ class HealthConnectReader(private val context: Context) {
     suspend fun readSince(since: Instant?, until: Instant, owner: String): List<CsvRow> {
         // Health Connect's TimeRangeFilter requires a strictly-after end time -- since == until
         // is not just "empty", it's rejected outright. That happens legitimately whenever a
-        // sync runs again within the same hour as the last one (e.g. a manual "Sync Now" right
-        // after the nightly sync already advanced the cursor to this hour's boundary): there's
-        // nothing new to read yet, so skip Health Connect entirely rather than querying it with
-        // degenerate bounds.
+        // sync runs again on the same local calendar day as the last one (e.g. a manual "Sync
+        // Now" after the nightly sync already advanced the cursor to today's start): there's
+        // nothing new to read yet, since today itself isn't a complete day to aggregate.
         if (since != null && !since.isBefore(until)) return emptyList()
         val range = TimeRangeFilter.between(since ?: Instant.EPOCH, until)
         val rows = mutableListOf<CsvRow>()
 
-        // Activity
-        rows += readSteps(range, owner)
+        // Activity -- additive, one summed row per local day
+        rows += readSumDaily(range, owner, StepsRecord::class, "steps", "count", asCount = true, endTime = { it.endTime }) { it.count.toDouble() }
         rows += readSleep(range, owner)
         rows += readExercise(range, owner)
-        rows += readScalarInterval(range, owner, DistanceRecord::class, "distance", "meters", endTime = { it.endTime }) { it.distance.inMeters }
-        rows += readScalarInterval(range, owner, ElevationGainedRecord::class, "elevation_gained", "meters", endTime = { it.endTime }) { it.elevation.inMeters }
-        rows += readScalarInterval(range, owner, FloorsClimbedRecord::class, "floors_climbed", "floors", endTime = { it.endTime }) { it.floors }
-        rows += readScalarInterval(range, owner, ActiveCaloriesBurnedRecord::class, "active_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
-        rows += readScalarInterval(range, owner, TotalCaloriesBurnedRecord::class, "total_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
-        rows += readScalarInterval(range, owner, WheelchairPushesRecord::class, "wheelchair_pushes", "count", endTime = { it.endTime }) { it.count.toDouble() }
-        rows += readScalarInterval(range, owner, HydrationRecord::class, "hydration", "liters", endTime = { it.endTime }) { it.volume.inLiters }
+        rows += readSumDaily(range, owner, DistanceRecord::class, "distance", "meters", endTime = { it.endTime }) { it.distance.inMeters }
+        rows += readSumDaily(range, owner, ElevationGainedRecord::class, "elevation_gained", "meters", endTime = { it.endTime }) { it.elevation.inMeters }
+        rows += readSumDaily(range, owner, FloorsClimbedRecord::class, "floors_climbed", "floors", asCount = true, endTime = { it.endTime }) { it.floors }
+        rows += readSumDaily(range, owner, ActiveCaloriesBurnedRecord::class, "active_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
+        rows += readSumDaily(range, owner, TotalCaloriesBurnedRecord::class, "total_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
+        rows += readSumDaily(range, owner, WheelchairPushesRecord::class, "wheelchair_pushes", "count", asCount = true, endTime = { it.endTime }) { it.count.toDouble() }
+        rows += readSumDaily(range, owner, HydrationRecord::class, "hydration", "liters", endTime = { it.endTime }) { it.volume.inLiters }
 
-        // Vitals -- low frequency (typically a handful of readings/day), no aggregation needed
-        rows += readHeartRate(range, owner)
-        rows += readScalarInstant(range, owner, RestingHeartRateRecord::class, "resting_heart_rate", "bpm", time = { it.time }) { it.beatsPerMinute.toDouble() }
-        rows += readScalarInstant(range, owner, HeartRateVariabilityRmssdRecord::class, "heart_rate_variability_rmssd", "ms", time = { it.time }) { it.heartRateVariabilityMillis }
-        rows += readScalarInstant(range, owner, OxygenSaturationRecord::class, "oxygen_saturation", "percent", time = { it.time }) { it.percentage.value }
-        rows += readScalarInstant(range, owner, RespiratoryRateRecord::class, "respiratory_rate", "breaths_per_min", time = { it.time }) { it.rate }
-        rows += readScalarInstant(range, owner, BodyTemperatureRecord::class, "body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
-        rows += readScalarInstant(range, owner, BasalBodyTemperatureRecord::class, "basal_body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
-        rows += readScalarInstant(range, owner, BloodGlucoseRecord::class, "blood_glucose", "mg_per_dL", time = { it.time }) { it.level.inMilligramsPerDeciliter }
+        // Vitals -- fluctuating, daily min/avg/max
+        rows += readAggregatedDaily(range, owner, HeartRateRecord::class, "heart_rate", "bpm") { r -> r.samples.map { it.time to it.beatsPerMinute.toDouble() } }
+        rows += readStatsDaily(range, owner, RestingHeartRateRecord::class, "resting_heart_rate", "bpm", time = { it.time }) { it.beatsPerMinute.toDouble() }
+        rows += readStatsDaily(range, owner, HeartRateVariabilityRmssdRecord::class, "heart_rate_variability_rmssd", "ms", time = { it.time }) { it.heartRateVariabilityMillis }
+        rows += readStatsDaily(range, owner, OxygenSaturationRecord::class, "oxygen_saturation", "percent", time = { it.time }) { it.percentage.value }
+        rows += readStatsDaily(range, owner, RespiratoryRateRecord::class, "respiratory_rate", "breaths_per_min", time = { it.time }) { it.rate }
+        rows += readStatsDaily(range, owner, BodyTemperatureRecord::class, "body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
+        rows += readStatsDaily(range, owner, BasalBodyTemperatureRecord::class, "basal_body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
+        rows += readStatsDaily(range, owner, BloodGlucoseRecord::class, "blood_glucose", "mg_per_dL", time = { it.time }) { it.level.inMilligramsPerDeciliter }
         rows += readBloodPressure(range, owner)
-        rows += readScalarInstant(range, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
+        rows += readStatsDaily(range, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
 
-        // Body measurements -- not from the Samsung watch (its BIA sensor doesn't pass through
-        // Health Connect at all, per the design doc), but a smart scale or other device writing
-        // standard Health Connect records for these is just as easy to read as anything else.
+        // Body measurements -- point-in-time, not aggregated. Not from the Samsung watch (its
+        // BIA sensor doesn't pass through Health Connect at all, per the design doc), but a
+        // smart scale or other device writing standard Health Connect records for these is just
+        // as easy to read as anything else.
         rows += readScalarInstant(range, owner, WeightRecord::class, "weight", "kg", time = { it.time }) { it.weight.inKilograms }
         rows += readScalarInstant(range, owner, HeightRecord::class, "height", "meters", time = { it.time }) { it.height.inMeters }
         rows += readScalarInstant(range, owner, BodyFatRecord::class, "body_fat", "percent", time = { it.time }) { it.percentage.value }
@@ -135,13 +145,13 @@ class HealthConnectReader(private val context: Context) {
         rows += readScalarInstant(range, owner, LeanBodyMassRecord::class, "lean_body_mass", "kg", time = { it.time }) { it.mass.inKilograms }
         rows += readScalarInstant(range, owner, BasalMetabolicRateRecord::class, "basal_metabolic_rate", "kcal_per_day", time = { it.time }) { it.basalMetabolicRate.inKilocaloriesPerDay }
 
-        // Dense sample-based interval records -- same hourly min/avg/max treatment as heart
+        // Dense sample-based interval records -- same daily min/avg/max treatment as heart
         // rate, for the same reason: continuous sampling during workouts would otherwise be by
         // far the dominant row source.
-        rows += readAggregatedHourly(range, owner, SpeedRecord::class, "speed", "m_per_s") { r -> r.samples.map { it.time to it.speed.inMetersPerSecond } }
-        rows += readAggregatedHourly(range, owner, PowerRecord::class, "power", "watts") { r -> r.samples.map { it.time to it.power.inWatts } }
-        rows += readAggregatedHourly(range, owner, CyclingPedalingCadenceRecord::class, "cycling_cadence", "rpm") { r -> r.samples.map { it.time to it.revolutionsPerMinute } }
-        rows += readAggregatedHourly(range, owner, StepsCadenceRecord::class, "steps_cadence", "steps_per_min") { r -> r.samples.map { it.time to it.rate } }
+        rows += readAggregatedDaily(range, owner, SpeedRecord::class, "speed", "m_per_s") { r -> r.samples.map { it.time to it.speed.inMetersPerSecond } }
+        rows += readAggregatedDaily(range, owner, PowerRecord::class, "power", "watts") { r -> r.samples.map { it.time to it.power.inWatts } }
+        rows += readAggregatedDaily(range, owner, CyclingPedalingCadenceRecord::class, "cycling_cadence", "rpm") { r -> r.samples.map { it.time to it.revolutionsPerMinute } }
+        rows += readAggregatedDaily(range, owner, StepsCadenceRecord::class, "steps_cadence", "steps_per_min") { r -> r.samples.map { it.time to it.rate } }
 
         return rows
     }
@@ -160,11 +170,11 @@ class HealthConnectReader(private val context: Context) {
     }
 
     /**
-     * Instantaneous vitals/body-measurement records (single `time` point): one row per record.
-     * Covers every such type used below except BloodPressureRecord, which has two values per
-     * record rather than one. `time` is passed explicitly rather than inferred from a shared
-     * interface -- Health Connect's InstantaneousRecord/IntervalRecord marker interfaces exist
-     * but are library-internal, not part of the public API surface.
+     * Instantaneous body-measurement records (single `time` point): one row per record, no
+     * aggregation -- these are point-in-time readings (a scale weigh-in), not a rate to smooth
+     * over a day. `time` is passed explicitly rather than inferred from a shared interface --
+     * Health Connect's InstantaneousRecord/IntervalRecord marker interfaces exist but are
+     * library-internal, not part of the public API surface.
      */
     private suspend fun <T : Record> readScalarInstant(
         range: TimeRangeFilter,
@@ -179,29 +189,46 @@ class HealthConnectReader(private val context: Context) {
             CsvRow(time(r), owner, metric, formatValue(value(r)), unit, r.metadata.id)
         }
 
-    /** Interval records (`startTime`/`endTime`, no dense sub-sampling): one row per record. */
-    private suspend fun <T : Record> readScalarInterval(
+    /** Additive interval metrics (steps, distance, calories, ...): one summed row per local day. */
+    private suspend fun <T : Record> readSumDaily(
         range: TimeRangeFilter,
         owner: String,
         recordType: KClass<T>,
         metric: String,
         unit: String,
+        asCount: Boolean = false,
         endTime: (T) -> Instant,
         value: (T) -> Double,
-    ): List<CsvRow> =
-        readAllPages(recordType, range).map { r ->
-            CsvRow(endTime(r), owner, metric, formatValue(value(r)), unit, r.metadata.id)
+    ): List<CsvRow> {
+        val byDay = readAllPages(recordType, range).groupBy { localDayOf(endTime(it)) }
+        return byDay.entries.sortedBy { it.key }.map { (day, records) ->
+            val total = records.sumOf(value)
+            CsvRow(day.asTimestamp(), owner, metric, formatSum(total, asCount), unit, "${metric}_daily_$day")
         }
+    }
+
+    /** Fluctuating scalar-instant metrics (blood pressure components, SpO2, ...): daily min/avg/max. */
+    private suspend fun <T : Record> readStatsDaily(
+        range: TimeRangeFilter,
+        owner: String,
+        recordType: KClass<T>,
+        metricPrefix: String,
+        unit: String,
+        time: (T) -> Instant,
+        value: (T) -> Double,
+    ): List<CsvRow> {
+        val byDay = readAllPages(recordType, range).groupBy { localDayOf(time(it)) }
+        return byDay.entries.sortedBy { it.key }.flatMap { (day, records) ->
+            dailyMinAvgMaxRows(day, owner, metricPrefix, unit, records.map(value))
+        }
+    }
 
     /**
-     * Shared hourly min/avg/max bucketing for dense sample-based records (speed, power, cycling
-     * cadence, steps cadence) -- the same treatment as heart rate, factored out since it's now
-     * used five times. Heart rate keeps its own hand-written version below rather than being
-     * folded into this: it predates this helper, is already verified end-to-end against real
-     * uploaded data, and its min/max are natively integer bpm rather than doubles -- not worth
-     * the risk of touching proven code to save a few lines.
+     * Dense sample-based interval records (heart rate, speed, power, cadence): daily min/avg/max
+     * over every raw sample in the day, not just one value per record -- a single interval
+     * record can span hours and contain hundreds of samples.
      */
-    private suspend fun <T : Record> readAggregatedHourly(
+    private suspend fun <T : Record> readAggregatedDaily(
         range: TimeRangeFilter,
         owner: String,
         recordType: KClass<T>,
@@ -209,98 +236,82 @@ class HealthConnectReader(private val context: Context) {
         unit: String,
         samplesOf: (T) -> List<Pair<Instant, Double>>,
     ): List<CsvRow> {
-        val byHour = readAllPages(recordType, range)
+        val byDay = readAllPages(recordType, range)
             .flatMap(samplesOf)
-            .groupBy { it.first.truncatedTo(ChronoUnit.HOURS) }
-
-        return byHour.entries.sortedBy { it.key }.flatMap { (bucketStart, samples) ->
-            val values = samples.map { it.second }
-            val bucketId = "${metricPrefix}_hourly_${bucketStart.epochSecond}"
-            listOf(
-                CsvRow(bucketStart, owner, "${metricPrefix}_min", formatValue(values.min()), unit, "$bucketId#min"),
-                CsvRow(bucketStart, owner, "${metricPrefix}_avg", formatValue(values.average()), unit, "$bucketId#avg"),
-                CsvRow(bucketStart, owner, "${metricPrefix}_max", formatValue(values.max()), unit, "$bucketId#max"),
-            )
+            .groupBy { localDayOf(it.first) }
+        return byDay.entries.sortedBy { it.key }.flatMap { (day, samples) ->
+            dailyMinAvgMaxRows(day, owner, metricPrefix, unit, samples.map { it.second })
         }
     }
+
+    private fun dailyMinAvgMaxRows(day: LocalDate, owner: String, metricPrefix: String, unit: String, values: List<Double>): List<CsvRow> {
+        val ts = day.asTimestamp()
+        val bucketId = "${metricPrefix}_daily_$day"
+        return listOf(
+            CsvRow(ts, owner, "${metricPrefix}_min", formatValue(values.min()), unit, "$bucketId#min"),
+            CsvRow(ts, owner, "${metricPrefix}_avg", formatValue(values.average()), unit, "$bucketId#avg"),
+            CsvRow(ts, owner, "${metricPrefix}_max", formatValue(values.max()), unit, "$bucketId#max"),
+        )
+    }
+
+    /** The phone's local calendar date for an instant -- the day a human actually experienced. */
+    private fun localDayOf(instant: Instant): LocalDate = instant.atZone(ZoneId.systemDefault()).toLocalDate()
+
+    /**
+     * A daily bucket's date, encoded as UTC midnight of that same date -- deliberately NOT a
+     * true timezone conversion (that would shift the displayed date by the local UTC offset,
+     * e.g. local midnight in KST becomes the previous day at 15:00 UTC). The point of daily
+     * aggregation is a file that's trivially pivotable by calendar date; a human reading
+     * timestamp_utc's date portion should see the same date they experienced, not a UTC-shifted
+     * one. See README's daily-aggregation note for the full rationale.
+     */
+    private fun LocalDate.asTimestamp(): Instant = atStartOfDay(ZoneOffset.UTC).toInstant()
 
     private fun formatValue(v: Double): String = String.format(Locale.US, "%.1f", v)
 
-    private suspend fun readSteps(range: TimeRangeFilter, owner: String): List<CsvRow> =
-        readAllPages(StepsRecord::class, range).map { r ->
-            CsvRow(
-                timestampUtc = r.endTime,
-                owner = owner,
-                metric = "steps",
-                value = r.count.toString(),
-                unit = "count",
-                sourceRecordId = r.metadata.id,
-            )
-        }
+    private fun formatSum(total: Double, asCount: Boolean): String =
+        if (asCount) Math.round(total).toString() else formatValue(total)
 
-    /**
-     * Continuous heart-rate sampling is dense enough (one sample every ~20-30s on a Galaxy
-     * Watch) that writing one CSV row per raw sample would produce ~100k rows/month from HR
-     * alone -- by far the dominant driver of file growth, confirmed against a real 30-day
-     * backfill. Bucketing into hourly min/avg/max keeps the same six-column schema and cuts
-     * that by roughly 45x. Buckets are UTC-hour aligned (not per-owner local time) so the
-     * result is deterministic regardless of the phone's timezone.
-     *
-     * SyncWorker truncates `until` down to the current hour boundary before calling this, so
-     * a bucket's samples are never split across two sync runs -- each hour is aggregated
-     * exactly once, from whichever sync run first reads records past its end.
-     */
-    private suspend fun readHeartRate(range: TimeRangeFilter, owner: String): List<CsvRow> {
-        val samplesByHour = readAllPages(HeartRateRecord::class, range)
-            .flatMap { it.samples }
-            .groupBy { it.time.truncatedTo(ChronoUnit.HOURS) }
-
-        return samplesByHour.entries.sortedBy { it.key }.flatMap { (bucketStart, samples) ->
-            val bpms = samples.map { it.beatsPerMinute }
-            val bucketId = "hr_hourly_${bucketStart.epochSecond}"
-            listOf(
-                CsvRow(bucketStart, owner, "heart_rate_min", bpms.min().toString(), "bpm", "$bucketId#min"),
-                CsvRow(
-                    bucketStart, owner, "heart_rate_avg",
-                    String.format(Locale.US, "%.1f", bpms.average()), "bpm", "$bucketId#avg"
-                ),
-                CsvRow(bucketStart, owner, "heart_rate_max", bpms.max().toString(), "bpm", "$bucketId#max"),
-            )
-        }
-    }
-
-    /** Two scalars per record, not one -- doesn't fit the generic scalar-instant helper. */
+    /** Two scalars per record, not one -- doesn't fit the generic stats-daily helper. */
     private suspend fun readBloodPressure(range: TimeRangeFilter, owner: String): List<CsvRow> {
+        val records = readAllPages(BloodPressureRecord::class, range)
         val rows = mutableListOf<CsvRow>()
-        for (r in readAllPages(BloodPressureRecord::class, range)) {
-            rows += CsvRow(r.time, owner, "blood_pressure_systolic", formatValue(r.systolic.inMillimetersOfMercury), "mmHg", "${r.metadata.id}#systolic")
-            rows += CsvRow(r.time, owner, "blood_pressure_diastolic", formatValue(r.diastolic.inMillimetersOfMercury), "mmHg", "${r.metadata.id}#diastolic")
+        records.groupBy { localDayOf(it.time) }.forEach { (day, dayRecords) ->
+            rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_systolic", "mmHg", dayRecords.map { it.systolic.inMillimetersOfMercury })
+            rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_diastolic", "mmHg", dayRecords.map { it.diastolic.inMillimetersOfMercury })
         }
         return rows
     }
 
+    /**
+     * Sleep sessions/stages summed per local day rather than one row per session or per stage
+     * segment -- a night's sleep normally alternates through several light/deep/REM/awake
+     * segments, which was by far the single densest metric in the file (confirmed against real
+     * data: ~35 `sleep_stage_light` rows/day alone) for no trend-relevant benefit over "total
+     * minutes of each stage that day".
+     */
     private suspend fun readSleep(range: TimeRangeFilter, owner: String): List<CsvRow> {
+        val sessions = readAllPages(SleepSessionRecord::class, range)
         val rows = mutableListOf<CsvRow>()
-        for (r in readAllPages(SleepSessionRecord::class, range)) {
-            rows += CsvRow(
-                timestampUtc = r.endTime,
-                owner = owner,
-                metric = "sleep_session_duration",
-                value = Duration.between(r.startTime, r.endTime).toMinutes().toString(),
-                unit = "minutes",
-                sourceRecordId = r.metadata.id,
-            )
-            r.stages.forEachIndexed { index, stage ->
-                rows += CsvRow(
-                    timestampUtc = stage.endTime,
-                    owner = owner,
-                    metric = "sleep_stage_${stageTypeName(stage.stage)}",
-                    value = Duration.between(stage.startTime, stage.endTime).toMinutes().toString(),
-                    unit = "minutes",
-                    sourceRecordId = "${r.metadata.id}#stage$index",
-                )
+
+        sessions.groupBy { localDayOf(it.endTime) }.forEach { (day, daySessions) ->
+            val totalMinutes = daySessions.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
+            rows += CsvRow(day.asTimestamp(), owner, "sleep_session_duration", totalMinutes.toString(), "minutes", "sleep_session_duration_daily_$day")
+        }
+
+        val stageMinutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
+        for (session in sessions) {
+            for (stage in session.stages) {
+                val key = localDayOf(stage.endTime) to stageTypeName(stage.stage)
+                val minutes = Duration.between(stage.startTime, stage.endTime).toMinutes()
+                stageMinutesByDayAndType.merge(key, minutes, Long::plus)
             }
         }
+        stageMinutesByDayAndType.entries.sortedBy { it.key.first }.forEach { (key, minutes) ->
+            val (day, type) = key
+            rows += CsvRow(day.asTimestamp(), owner, "sleep_stage_$type", minutes.toString(), "minutes", "sleep_stage_${type}_daily_$day")
+        }
+
         return rows
     }
 
@@ -315,17 +326,19 @@ class HealthConnectReader(private val context: Context) {
         else -> "unknown"
     }
 
-    private suspend fun readExercise(range: TimeRangeFilter, owner: String): List<CsvRow> =
-        readAllPages(ExerciseSessionRecord::class, range).map { r ->
-            CsvRow(
-                timestampUtc = r.endTime,
-                owner = owner,
-                metric = "exercise_${exerciseTypeName(r.exerciseType)}",
-                value = Duration.between(r.startTime, r.endTime).toMinutes().toString(),
-                unit = "minutes",
-                sourceRecordId = r.metadata.id,
-            )
+    /** Exercise minutes summed per local day, per exercise type (two runs the same day -> one row). */
+    private suspend fun readExercise(range: TimeRangeFilter, owner: String): List<CsvRow> {
+        val minutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
+        for (r in readAllPages(ExerciseSessionRecord::class, range)) {
+            val key = localDayOf(r.endTime) to exerciseTypeName(r.exerciseType)
+            val minutes = Duration.between(r.startTime, r.endTime).toMinutes()
+            minutesByDayAndType.merge(key, minutes, Long::plus)
         }
+        return minutesByDayAndType.entries.sortedBy { it.key.first }.map { (key, minutes) ->
+            val (day, type) = key
+            CsvRow(day.asTimestamp(), owner, "exercise_$type", minutes.toString(), "minutes", "exercise_${type}_daily_$day")
+        }
+    }
 
     private fun exerciseTypeName(type: Int): String = when (type) {
         ExerciseSessionRecord.EXERCISE_TYPE_RUNNING -> "running"

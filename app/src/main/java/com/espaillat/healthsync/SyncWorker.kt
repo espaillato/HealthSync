@@ -13,9 +13,10 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalTime
+import java.time.ZoneId
 import java.time.ZonedDateTime
-import java.time.temporal.ChronoUnit
 import java.util.concurrent.TimeUnit
 
 /** WorkManager worker: HealthConnectReader -> DriveUploader, cursor only advances on success. */
@@ -36,12 +37,17 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         }
 
         val since = syncState.lastSyncCursor
-        // Truncated to the hour so a heart-rate bucket (see HealthConnectReader.readHeartRate)
-        // never gets split across two sync runs -- each hour is only ever aggregated once, by
-        // whichever sync first reads past its end. If since is still ahead of this (e.g. two
-        // syncs within the same hour), HealthConnectReader.readSince short-circuits to empty
-        // rather than querying Health Connect with degenerate bounds.
-        val until = Instant.now().truncatedTo(ChronoUnit.HOURS)
+        // Truncated to the start of today (local time) so a daily bucket (see
+        // HealthConnectReader's readSumDaily/readStatsDaily/readAggregatedDaily) never gets
+        // split across two sync runs -- a day is only ever aggregated once it's actually over,
+        // by whichever sync first reads past its end. Concretely: this excludes all of today's
+        // still-accumulating data from every sync until tomorrow, when today becomes a complete
+        // past day. That's intentional, not a bug -- daily aggregates are for trend tracking
+        // (weeks/months/years), not a live same-day total, and it pairs naturally with the
+        // nightly ~2am schedule (by then yesterday is long since complete). If since is still
+        // ahead of this (e.g. two syncs on the same local day), HealthConnectReader.readSince
+        // short-circuits to empty rather than querying Health Connect with degenerate bounds.
+        val until = LocalDate.now(ZoneId.systemDefault()).atStartOfDay(ZoneId.systemDefault()).toInstant()
 
         return try {
             val rows = reader.readSince(since, until, owner.label)
@@ -57,9 +63,9 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
             // looks backward. Leaving the cursor unmoved on an empty result costs nothing here
             // (Health Connect reads are local, not network calls) and guarantees a late backfill
             // into a previously-empty window still gets picked up on the next sync. Never move
-            // the cursor backward either way -- right after upgrading from an older un-truncated
-            // cursor to this hour-aligned one, `until` can briefly land earlier than an existing
-            // mid-hour cursor, and writing that back would cause the next sync to re-read
+            // the cursor backward either way -- right after upgrading from an older
+            // differently-truncated cursor to this one, `until` can briefly land earlier than an
+            // existing cursor, and writing that back would cause the next sync to re-read
             // already-synced data.
             if (rows.isNotEmpty() && (since == null || until.isAfter(since))) {
                 syncState.lastSyncCursor = until
