@@ -179,11 +179,16 @@ midnight.
 
 **Aggregated to daily min/avg/max, three rows per local day** (fluctuating readings — heart
 rate, resting heart rate, HRV, oxygen saturation, respiratory rate, body/basal temperature,
-blood glucose, blood pressure, VO2 max, speed, power, cycling cadence, steps cadence).
+blood glucose, VO2 max, speed, power, cycling cadence, steps cadence).
 
 **Not aggregated — one row per record, point-in-time** (weight, height, body fat %, bone mass,
-lean body mass, basal metabolic rate) — a scale reading is a snapshot, not a rate to smooth
-over a day.
+lean body mass, basal metabolic rate, **blood pressure**) — a scale reading, or a blood
+pressure check, is a deliberate spot measurement, not a rate to smooth over a day. Blood
+pressure was originally grouped with the aggregated metrics above on the assumption it'd need
+the same noise-reduction treatment as something like heart rate; real data (once
+[the Samsung Health Monitor import](#blood-pressure-import-samsung-health-monitor) existed to
+actually produce some, since Health Connect never has any on its own — see that section) showed
+2-3 deliberate readings a day, not hundreds of continuous samples, so it moved here instead.
 
 A day (or sleep day) is only synced once it's actually over — see "Behavior note" below.
 
@@ -217,6 +222,59 @@ knowing going in.
 Timestamps on daily-aggregated rows use the local calendar date encoded as UTC midnight of that
 same date string — deliberately not a true timezone conversion, so `timestamp_utc`'s date
 portion always matches the day a human actually experienced rather than a UTC-shifted one.
+
+## Blood pressure import (Samsung Health Monitor)
+
+Samsung Health Monitor — the separate app used for Galaxy Watch blood pressure readings — never
+publishes that data to Health Connect at all, on any Samsung Health/Health Monitor version.
+This isn't a settings toggle to go find: its `BpContentProvider` requires a
+`signature|privileged` permission, confirmed by an actual `SecurityException` querying it
+directly (`content://com.samsung.android.shealthmonitor.bp`). No third-party app can ever hold
+that permission, sideloaded or not — so unlike everything else this app reads, there is no
+background-sync path for this data. It has to be a manual export.
+
+**How to use it:** in Samsung Health Monitor, open blood pressure history → **Export → PDF** →
+share it → pick **"Import to HealthSync"** from the share sheet. HealthSync parses the PDF,
+shows exactly what it found (every reading, plus any parsing warnings) before touching
+anything, and only stages it for upload once you tap **Add to Sync** — nothing is written to
+Drive without that explicit confirmation. Health Monitor's HTML export option isn't handled
+(it wasn't available on the device/app version this was built against — see
+`ImportShareActivity`'s manifest entry if that ever changes and it's worth adding).
+
+**Under the hood:** the PDF is small and machine-generated with real embedded text, not a scan,
+so it's parsed directly (`PDFBox-Android`, no OCR — avoids a misread-digit risk on top of the
+parsing itself, which matters more here than anywhere else in this app). Confirming the import
+doesn't upload directly: it stages the parsed rows locally (`PendingImports`) and triggers
+`SyncWorker`, which folds them into the *same* upload as Health Connect data on its next run.
+One code path talks to Drive in this app, not two that could quietly drift apart.
+
+**One row per reading, not aggregated** — same point-in-time treatment as weight/height/etc.
+above (see that section for why blood pressure specifically belongs there), producing its own
+`blood_pressure_pulse` metric alongside `blood_pressure_systolic`/`blood_pressure_diastolic` —
+deliberately not folded into the general `heart_rate` metric, since a pulse taken during a BP
+measurement isn't the same clinical context as continuous or exercise heart rate. Because each
+reading is its own row with its own timestamp, there's no "today isn't finished yet" concern
+the way there is for this file's daily-aggregated metrics — nothing to protect against
+finalizing an incomplete bucket too early, so every reading in an export uploads immediately,
+including today's.
+
+**Duplicate handling across exports — the normal case, not an edge case:** Health Monitor's own
+export windows (1 week, 2 weeks, last month, last 3 months, year to date) all overlap each
+other, so re-exporting routinely re-covers days already synced. This is safe by design at two
+levels: a reading already on Drive is skipped via a `source_record_id` synthesized from its own
+date and time (`blood_pressure_<date>T<HHmm>#systolic`, etc. — deterministic, so the same
+reading always produces the same ID), and a second, batch-level dedup in
+`DriveUploader.appendRows` catches the case that check alone can't — two overlapping staged
+imports both sitting un-synced at once, producing the same ID twice in a single upload.
+
+**Workflow: exporting weekly or monthly instead of daily is fine.** A staged import isn't lost
+if a sync doesn't happen right away or a sync attempt fails — it's only cleared after
+successfully uploading, same "only advance state on success" rule the Health Connect sync
+cursor follows. The one real thing to get right: **pick an export window at least as wide as
+the gap since your last export.** The importer only ever sees what's inside the PDF you share —
+sharing a "1 week" export once a month would leave a genuine ~3-week gap in the data, not a
+duplicate, since nothing outside that window was ever in the file to begin with. Exporting
+"last month" (or wider) on a monthly cadence keeps every day covered with room to spare.
 
 ## Verifying it worked
 

@@ -1,6 +1,7 @@
 package com.espaillat.healthsync
 
 import android.content.Context
+import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
@@ -68,6 +69,56 @@ data class CsvRow(
 
     companion object {
         const val HEADER = "timestamp_utc,owner,metric,value,unit,source_record_id"
+
+        /**
+         * Reverses [toCsvLine]. Used by [PendingImports] to read back rows staged from a
+         * non-Health-Connect source (currently just the Samsung Health Monitor PDF import) --
+         * never called on Drive's own file content, which only ever gets read as raw text for
+         * dedup/header purposes, not parsed back into CsvRow. Returns null (never throws) on a
+         * line that doesn't split into exactly 6 fields or has an unparseable timestamp, so one
+         * corrupted staged line can't take down an entire sync.
+         */
+        fun fromCsvLine(line: String): CsvRow? {
+            val fields = splitCsvLine(line)
+            if (fields.size != 6) return null
+            return try {
+                CsvRow(
+                    timestampUtc = Instant.parse(fields[0]),
+                    owner = fields[1],
+                    metric = fields[2],
+                    value = fields[3],
+                    unit = fields[4],
+                    sourceRecordId = fields[5],
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        private fun splitCsvLine(line: String): List<String> {
+            val fields = mutableListOf<String>()
+            val current = StringBuilder()
+            var inQuotes = false
+            var i = 0
+            while (i < line.length) {
+                val c = line[i]
+                when {
+                    inQuotes && c == '"' && i + 1 < line.length && line[i + 1] == '"' -> {
+                        current.append('"')
+                        i++
+                    }
+                    c == '"' -> inQuotes = !inQuotes
+                    c == ',' && !inQuotes -> {
+                        fields += current.toString()
+                        current.clear()
+                    }
+                    else -> current.append(c)
+                }
+                i++
+            }
+            fields += current.toString()
+            return fields
+        }
     }
 }
 
@@ -82,9 +133,10 @@ data class CsvRow(
  * users and would otherwise bloat the permission consent screen with irrelevant categories.
  *
  * Everything except point-in-time body measurements (weight, height, body fat, bone mass, lean
- * body mass, basal metabolic rate) is aggregated to one local calendar day per row -- sums for
- * additive metrics (steps, distance, calories, sleep-stage minutes, exercise minutes, ...), and
- * min/avg/max for fluctuating ones (heart rate, blood pressure, speed/power/cadence, ...). Sleep
+ * body mass, basal metabolic rate, blood pressure -- deliberate spot readings, a handful a day,
+ * not dense enough to need smoothing) is aggregated to one local calendar day per row -- sums
+ * for additive metrics (steps, distance, calories, sleep-stage minutes, exercise minutes, ...),
+ * and min/avg/max for genuinely fluctuating ones (heart rate, speed/power/cadence, ...). Sleep
  * specifically buckets by a noon-to-noon "sleep day" instead (see [sleepDayOf]) -- sessions
  * normally cross midnight, so calendar-day bucketing would routinely split or misattribute a
  * single night's sleep. This is all for long-run trend tracking (weeks/months/years), not live
@@ -167,13 +219,21 @@ class HealthConnectReader(private val context: Context) {
         rows += readStatsDaily(range, owner, BodyTemperatureRecord::class, "body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
         rows += readStatsDaily(range, owner, BasalBodyTemperatureRecord::class, "basal_body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
         rows += readStatsDaily(range, owner, BloodGlucoseRecord::class, "blood_glucose", "mg_per_dL", time = { it.time }) { it.level.inMilligramsPerDeciliter }
-        rows += readBloodPressure(range, owner)
         rows += readStatsDaily(range, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
 
         // Body measurements -- point-in-time, not aggregated. Not from the Samsung watch (its
         // BIA sensor doesn't pass through Health Connect at all, per the design doc), but a
         // smart scale or other device writing standard Health Connect records for these is just
         // as easy to read as anything else.
+        //
+        // Blood pressure lives here too, not with the dense fluctuating metrics below --
+        // originally grouped with heart rate/speed/etc. on the assumption that it'd need the
+        // same noise-reduction treatment, but real data (once the Samsung Health Monitor import
+        // existed to actually produce some, see SamsungHealthMonitorPdfImporter) showed 2-3
+        // deliberate spot readings a day, not hundreds of continuous samples. Aggregating that
+        // into a daily average would blur exactly the individual readings someone would
+        // actually want to see, for noise-reduction benefit that was never really there.
+        rows += readBloodPressure(range, owner)
         rows += readScalarInstant(range, owner, WeightRecord::class, "weight", "kg", time = { it.time }) { it.weight.inKilograms }
         rows += readScalarInstant(range, owner, HeightRecord::class, "height", "meters", time = { it.time }) { it.height.inMeters }
         rows += readScalarInstant(range, owner, BodyFatRecord::class, "body_fat", "percent", time = { it.time }) { it.percentage.value }
@@ -196,9 +256,27 @@ class HealthConnectReader(private val context: Context) {
         val all = mutableListOf<T>()
         var pageToken: String? = null
         do {
-            val response = client.readRecords(
-                ReadRecordsRequest(recordType = recordType, timeRangeFilter = range, pageToken = pageToken)
-            )
+            val response = try {
+                client.readRecords(
+                    ReadRecordsRequest(recordType = recordType, timeRangeFilter = range, pageToken = pageToken)
+                )
+            } catch (e: Exception) {
+                // Health Connect's own client can throw while deserializing a record that's
+                // already sitting in the platform store -- observed in practice as
+                // IllegalArgumentException("startTime must be before endTime") from a malformed
+                // record some other app (Samsung Health, in the one case seen so far) wrote
+                // directly, not from anything about this query's window. There's no API to skip
+                // just the bad record and keep paginating past it -- the whole read call for
+                // that record type aborts. Caught here rather than at the readSince level so it
+                // can't take the entire sync down: readAllPages runs once per record type, so
+                // one corrupted metric fails on its own and every other metric in the same sync
+                // still succeeds normally. Logged loudly (not silently dropped) since this exact
+                // record type will keep failing every sync until either the query window
+                // advances past the bad record's timestamp or the record itself gets fixed at
+                // the source.
+                Log.w(TAG, "readRecords failed for ${recordType.simpleName}, skipping this metric for this sync", e)
+                break
+            }
             all += response.records
             pageToken = response.pageToken
         } while (!pageToken.isNullOrEmpty())
@@ -243,7 +321,7 @@ class HealthConnectReader(private val context: Context) {
         }
     }
 
-    /** Fluctuating scalar-instant metrics (blood pressure components, SpO2, ...): daily min/avg/max. */
+    /** Fluctuating scalar-instant metrics (SpO2, respiratory rate, ...): daily min/avg/max. */
     private suspend fun <T : Record> readStatsDaily(
         range: TimeRangeFilter,
         owner: String,
@@ -328,16 +406,20 @@ class HealthConnectReader(private val context: Context) {
     private fun formatSum(total: Double, asCount: Boolean): String =
         if (asCount) Math.round(total).toString() else formatValue(total)
 
-    /** Two scalars per record, not one -- doesn't fit the generic stats-daily helper. */
+    /**
+     * Point-in-time, one row per record -- two scalars per record rather than one, so this
+     * doesn't fit [readScalarInstant]'s single-value shape, but it's the same treatment: no
+     * daily bucketing, no completeness filtering (nothing to protect against re-finalizing an
+     * incomplete day, since each record is immutable and independently identified by Health
+     * Connect's own record UUID). See the call site's comment for why this moved out of the
+     * dense/fluctuating-metric bucket it started in.
+     */
     private suspend fun readBloodPressure(range: TimeRangeFilter, owner: String): List<CsvRow> {
-        val records = readAllPages(BloodPressureRecord::class, range)
         val rows = mutableListOf<CsvRow>()
-        records.groupBy { localDayOf(it.time) }
-            .filterKeys { isCompleteCalendarDay(it) }
-            .forEach { (day, dayRecords) ->
-                rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_systolic", "mmHg", dayRecords.map { it.systolic.inMillimetersOfMercury })
-                rows += dailyMinAvgMaxRows(day, owner, "blood_pressure_diastolic", "mmHg", dayRecords.map { it.diastolic.inMillimetersOfMercury })
-            }
+        for (r in readAllPages(BloodPressureRecord::class, range)) {
+            rows += CsvRow(r.time, owner, "blood_pressure_systolic", formatValue(r.systolic.inMillimetersOfMercury), "mmHg", "${r.metadata.id}#systolic")
+            rows += CsvRow(r.time, owner, "blood_pressure_diastolic", formatValue(r.diastolic.inMillimetersOfMercury), "mmHg", "${r.metadata.id}#diastolic")
+        }
         return rows
     }
 
@@ -418,6 +500,8 @@ class HealthConnectReader(private val context: Context) {
     }
 
     companion object {
+        private const val TAG = "HealthConnectReader"
+
         val REQUIRED_PERMISSIONS = setOf(
             HealthPermission.getReadPermission(StepsRecord::class),
             HealthPermission.getReadPermission(HeartRateRecord::class),

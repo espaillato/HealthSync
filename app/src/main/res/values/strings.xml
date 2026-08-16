@@ -23,6 +23,14 @@
     <string name="status_permissions_needed">Health Connect permissions needed — tap Sync Now</string>
     <string name="status_health_connect_unavailable">Health Connect isn\'t available on this device</string>
 
+    <string name="import_share_label">Import to HealthSync</string>
+    <string name="button_done">Done</string>
+    <string name="button_add_to_sync">Add to Sync</string>
+    <string name="status_import_not_a_pdf_share">This screen only handles a PDF shared via \"Import to HealthSync\" -- nothing to do here otherwise.</string>
+    <string name="status_import_no_file">No file attached to this share.</string>
+    <string name="status_import_parsing">Parsing PDF…</string>
+    <string name="status_import_parse_failed">Couldn\'t parse the PDF: %1$s</string>
+
     <string name="widget_label">HealthSync</string>
     <string name="widget_subtitle">Tap to open</string>
     <string name="widget_last_sync">Synced %1$s</string>

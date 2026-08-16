@@ -67,6 +67,24 @@
             android:name=".MainActivity"
             android:exported="false" />
 
+        <!-- Share target for Samsung Health Monitor's blood-pressure PDF export. Health
+             Monitor's own data is otherwise unreachable (its BpContentProvider requires a
+             signature|privileged permission no third-party app can hold; confirmed via a
+             direct SecurityException querying it), so a manual export/share is the only route
+             in. PDF only: Health Monitor's HTML export option wasn't available when this was
+             built against a real device/app version, so it isn't handled; only add an HTML
+             intent-filter once there's a real sample to build a parser against, not before. -->
+        <activity
+            android:name=".ImportShareActivity"
+            android:exported="true"
+            android:label="@string/import_share_label">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+        </activity>
+
         <!-- Lets Health Connect deep-link into this app's permissions-usage/rationale screen.
              Two declarations are required, not one: Android <=13 (or standalone Health Connect
              app on 26-33) resolves the plain ACTION_SHOW_PERMISSIONS_RATIONALE action; Android

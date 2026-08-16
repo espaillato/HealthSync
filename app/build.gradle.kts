@@ -24,8 +24,8 @@ android {
         applicationId = "com.espaillat.healthsync"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     signingConfigs {
@@ -92,6 +92,14 @@ dependencies {
 
     // Health Connect
     implementation("androidx.health.connect:connect-client:1.1.0")
+
+    // On-device PDF text extraction for the Samsung Health Monitor blood-pressure import (its
+    // BpContentProvider is signature|privileged-locked, confirmed via a direct SecurityException
+    // querying it -- a manual PDF export/share is the only route in). The export is a small,
+    // machine-generated PDF with real embedded text, not a scan, so text extraction is both
+    // simpler and more accurate than OCR here -- no misread-digit risk on top of the parsing
+    // itself. Android has no built-in PDF text-extraction API (PdfRenderer only rasterizes).
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 
     // Background work (widget-triggered sync)
     implementation("androidx.work:work-runtime-ktx:2.11.2")

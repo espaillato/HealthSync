@@ -55,6 +55,16 @@ class DriveUploader(private val context: Context) {
     fun appendRows(owner: Owner, rows: List<CsvRow>, syncState: SyncState) {
         if (rows.isEmpty()) return
 
+        // Dedup *within* this batch, not just against what's already in the Drive file below.
+        // Single-source callers (Health Connect alone) never produce internal duplicates, so
+        // this is a no-op for them -- it matters once a batch can combine rows from more than
+        // one source in the same call (Health Connect data plus a staged Samsung Health Monitor
+        // PDF import, see PendingImports/SyncWorker), where overlapping export windows routinely
+        // produce the same source_record_id from two different staged files. The existing-file
+        // check further down can't catch that -- it only knows about rows already on Drive, not
+        // duplicates sitting next to each other in the same incoming batch.
+        val rows = rows.distinctBy { it.sourceRecordId }
+
         val drive = buildDriveClient()
         val folderId = findWearableDataFolderId(drive)
             ?: throw DriveUploaderException(

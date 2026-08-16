@@ -1,6 +1,7 @@
 package com.espaillat.healthsync
 
 import android.content.Context
+import android.util.Log
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -43,34 +44,65 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         // regardless of what that cutoff is.
         val now = Instant.now()
 
+        // Snapshotted up front, not re-read after uploading -- see PendingImports' own doc for
+        // why: only the files captured in *this* snapshot get cleared below, so anything staged
+        // while this worker is running (a share arriving mid-run, say) isn't deleted before it's
+        // ever actually been uploaded.
+        val pendingSnapshot = PendingImports.snapshot(applicationContext)
+        val pendingRows = pendingSnapshot.flatMap { it.second }
+
         return try {
-            val rows = reader.readSince(since, now, owner.label)
-            if (rows.isNotEmpty()) {
-                DriveUploader(applicationContext).appendRows(owner, rows, syncState)
+            val hcRows = reader.readSince(since, now, owner.label)
+            // Health Connect and the staged Samsung Health Monitor import (see PendingImports)
+            // are two independent data sources feeding the same upload -- deliberately one
+            // appendRows call for both rather than two separate uploads, so there's a single
+            // place that authenticates, dedups, and reports status for everything this app
+            // writes to Drive.
+            val allRows = hcRows + pendingRows
+            if (allRows.isNotEmpty()) {
+                DriveUploader(applicationContext).appendRows(owner, allRows, syncState)
             }
-            // Only advance the cursor when a sync actually found something. Health Connect
-            // write sources can backfill *already-passed* timestamps -- e.g. Samsung Health,
-            // the moment it's first granted write access, wrote several hours of that day's
-            // heart-rate history retroactively. If the cursor had already advanced past that
-            // window (because an earlier sync ran before the backfill happened and legitimately
-            // found nothing), that data would become permanently unreachable: the cursor never
-            // looks backward. Leaving the cursor unmoved on an empty result costs nothing here
-            // (Health Connect reads are local, not network calls) and guarantees a late backfill
-            // into a previously-empty window still gets picked up on the next sync.
+            // Pending-import files are only cleared once appendRows above has actually
+            // succeeded -- an exception there is caught below and returns a failure before this
+            // line runs, leaving the staged files in place for the next attempt. Same
+            // "only advance state on success" rule the cursor itself follows just below.
+            if (pendingSnapshot.isNotEmpty()) {
+                PendingImports.clear(pendingSnapshot.map { it.first })
+            }
+
+            // Only advance the cursor when Health Connect itself actually found something --
+            // deliberately keyed on hcRows, not allRows/pendingRows. The cursor is Health
+            // Connect's own high-water mark; the Samsung Health Monitor import path has no
+            // cursor concept at all (a staged file's mere presence/absence *is* its "already
+            // synced" state, cleared above), so it has no bearing on this decision either way.
+            //
+            // Health Connect write sources can backfill *already-passed* timestamps -- e.g.
+            // Samsung Health, the moment it's first granted write access, wrote several hours of
+            // that day's heart-rate history retroactively. If the cursor had already advanced
+            // past that window (because an earlier sync ran before the backfill happened and
+            // legitimately found nothing), that data would become permanently unreachable: the
+            // cursor never looks backward. Leaving the cursor unmoved on an empty result costs
+            // nothing here (Health Connect reads are local, not network calls) and guarantees a
+            // late backfill into a previously-empty window still gets picked up on the next sync.
             //
             // The cursor advances to safeCursorBoundary(), not to `now` -- never past a point
             // that could still receive more data for some metric. Never move it backward either
             // way, in case a prior cursor (from before this boundary logic existed) is somehow
             // already ahead of it.
             val safeBoundary = reader.safeCursorBoundary()
-            if (rows.isNotEmpty() && (since == null || safeBoundary.isAfter(since))) {
+            if (hcRows.isNotEmpty() && (since == null || safeBoundary.isAfter(since))) {
                 syncState.lastSyncCursor = safeBoundary
             }
             syncState.lastSyncTimestamp = now
             syncState.lastSyncStatus = SyncStatus.SUCCESS
             syncState.lastSyncError = null
-            Result.success(workDataOf(KEY_ROWS_SYNCED to rows.size))
+            Result.success(workDataOf(KEY_ROWS_SYNCED to allRows.size))
         } catch (e: Exception) {
+            // Full stack trace to logcat -- the UI only ever gets to show e.message, which for
+            // a generic IllegalArgumentException-style message ("startTime must be before
+            // endTime") is nowhere near enough to find the actual throw site. Diagnosing that
+            // exact case without this cost a redundant round trip once already.
+            Log.e(TAG, "Sync failed", e)
             recordFailure(syncState, e.message ?: e.javaClass.simpleName)
         }
     }
@@ -83,6 +115,8 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
     }
 
     companion object {
+        private const val TAG = "HealthSyncWorker"
+
         /** Unique name for on-demand syncs (app launch, manual "Sync Now" tap). */
         const val MANUAL_WORK_NAME = "health_sync_manual_work"
 
