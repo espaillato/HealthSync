@@ -1,16 +1,41 @@
 # HealthSync
 
-Reads Samsung Health data (via Android's Health Connect) and pushes it to a shared Google
-Drive CSV, on a recurring basis, from two sideloaded phones (Ozzy's and Max's). See
-[`Samsung_Health_Sync_App_Design_Doc.md`](Samsung_Health_Sync_App_Design_Doc.md) for the full
-design brief this was built from.
+Reads your phone's [Android Health Connect](https://health.google/health-connect-android/) data
+and appends it to a long-format CSV in Google Drive, on a recurring background schedule. Install
+it on as many phones as you want (one per person) — each one picks its own name on first launch
+and writes to its own file in a shared Drive folder, so the data never collides.
 
-## ⚠️ Step 0 — one-time Google Drive setup (do this before installing on either phone)
+**The core sync is Health Connect-only and works with any data source that writes into it** —
+Samsung Health, Google Fit-compatible apps, a smart scale, whatever populates Health Connect on
+your phone. Two extra, entirely optional features are Samsung-specific and only do anything if
+you're on a Samsung device — see [Samsung Health full-data export import](#samsung-health-full-data-export-import-optional-samsung-only)
+and [Blood pressure import](#blood-pressure-import-samsung-health-monitor-optional-samsung-only)
+below. Skip both sections if you're not on Samsung Health; the rest of the app works exactly the
+same without them.
 
-The app authenticates to Drive as a **service account**, not as your personal Google
-account. A service account has no Drive storage of its own — if you skip this step, uploads
-will succeed silently and land in the service account's own invisible Drive instead of your
-`File Archive`.
+No Play Store distribution — this is meant to be built and sideloaded yourself. See
+[`Samsung_Health_Sync_App_Design_Doc.md`](Samsung_Health_Sync_App_Design_Doc.md) for the
+original design brief this was built from (a useful read for the reasoning behind some choices,
+but the code and this README are the current source of truth — that doc reflects where the
+project started, not everything it grew into since).
+
+## Set up with an AI coding agent
+
+This repo ships a [`CLAUDE.md`](CLAUDE.md) written for exactly this: clone it, build it, and
+install it on your phone(s) with the help of a coding agent (Claude Code or another agent that
+reads project instructions files) rather than doing every step by hand. A prompt to get started:
+
+> Clone `https://github.com/espaillato/HealthSync`, read `CLAUDE.md`, and set it up for me —
+> build a signed release APK and install it on my Android phone(s) over adb, walking me through
+> the one-time Google Drive and signing-key setup along the way.
+
+Everything below still applies if you'd rather do it by hand.
+
+## ⚠️ Step 0 — one-time Google Drive setup (do this before installing on any phone)
+
+The app authenticates to Drive as a **service account**, not as your personal Google account. A
+service account has no Drive storage of its own — if you skip this step, uploads will succeed
+silently and land in the service account's own invisible Drive instead of your Drive.
 
 1. **Create the service account** (skip if you already have one for this purpose):
    - Go to [Google Cloud Console → IAM & Admin → Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts).
@@ -24,23 +49,26 @@ will succeed silently and land in the service account's own invisible Drive inst
    - If the Drive API isn't already enabled on that project, enable it under
      **APIs & Services → Library → Google Drive API**.
 
-2. **Create the destination folder** in your own Google Drive (if it doesn't already exist):
-   `File Archive/Health/Wearable_Data/`
+2. **Create a destination folder** in your own Google Drive (if it doesn't already exist), named
+   exactly `Wearable_Data`. It can live anywhere in your Drive — the app finds it by name, not by
+   a fixed path.
 
 3. **Share the `Wearable_Data` folder** with the service account's email as **Editor**
    (right-click the folder → Share). This is the step that makes the shared folder visible
    to the app — without it, nothing will appear in your Drive even if the app reports success.
 
-4. **Create empty placeholder files yourself** — as your own Google account, inside
-   `Wearable_Data` — named exactly `Ozzy_Samsung_Health_Sync.csv` and
-   `Max_Samsung_Health_Sync.csv`. This step is easy to skip and the app will look like it's
-   working right up until it isn't: **service accounts have no storage quota of their own**,
-   so they can create files inside a folder shared with them as Editor — Drive rejects it
+4. **Create an empty placeholder CSV yourself** — as your own Google account, inside
+   `Wearable_Data` — for each person's install, named exactly `<Name>_Samsung_Health_Sync.csv`
+   (e.g. `Alex_Samsung_Health_Sync.csv` — see [Metrics synced](#metrics-synced) for why the
+   filename keeps the `Samsung_Health_Sync` suffix regardless of your actual data source; it's
+   just the app's fixed naming convention). This step is easy to skip and the app will look like
+   it's working right up until it isn't: **service accounts have no storage quota of their own**,
+   so they can't create files inside a folder shared with them as Editor — Drive rejects it
    with a `storageQuotaExceeded` 403, even though Editor access clearly allows writing. They
    *can*, however, update a file that already exists, since that storage is charged to the
-   file's real owner (you), not to whoever's writing to it. Pre-creating empty files sidesteps
-   the whole problem: every sync from then on only ever updates, never creates. (The app
-   surfaces this exact explanation in its status line if you hit it before reading this.)
+   file's real owner (you), not to whoever's writing to it. Pre-creating the empty file
+   sidesteps the whole problem: every sync from then on only ever updates, never creates. (The
+   app surfaces this exact explanation in its status line if you hit it before reading this.)
 
 5. **Get the key file onto each phone**, then import it from inside the app — tap **Import
    Drive Key** on the main screen (shown automatically whenever no key is present yet), and
@@ -58,7 +86,8 @@ will succeed silently and land in the service account's own invisible Drive inst
    debuggable builds. A release build, which is what you should actually be running long-term,
    rejects it outright with "package not debuggable". The in-app import works on both.)*
 
-   Repeat for Max's phone with the same key file — both installs share one service account.
+   Repeat on every additional phone with the same key file — every install shares one service
+   account.
 
 ## Build
 
@@ -95,10 +124,9 @@ keyAlias=healthsync
 keyPassword=<same password — PKCS12 keystores don't support separate store/key passwords>
 ```
 
-## Install (sideload, both phones)
+## Install (sideload, each phone)
 
-No Play Store distribution — this is a personal two-phone tool. Install the **release** build
-day-to-day; debug is for iterating on the code itself.
+Install the **release** build day-to-day; debug is for iterating on the code itself.
 
 ```bash
 adb install -r app/build/outputs/apk/release/app-release.apk
@@ -113,13 +141,14 @@ sideloaded APK; dismiss it.
 
 On first launch:
 
-1. Pick **Ozzy** or **Max** — this is a one-time, permanent choice per install (there's no way
-   to change it later short of clearing app data, by design — see the design doc §2/§8).
-2. Grant the requested Health Connect permissions — see "Metrics synced" below for the full
-   list. Health Connect shows this as two screens, not one: the main per-category grant, then
-   a second "Allow additional access" screen for two special permissions (access past data
-   beyond the normal 30-day-from-grant window, and access data in the background so the
-   nightly sync can actually read anything while the app isn't open) — grant both.
+1. **Enter a name** — this is a one-time, permanent choice per install (there's no way to
+   change it later short of clearing app data, by design). Whatever you type becomes the Drive
+   filename and the `owner` column in every synced row.
+2. Grant the requested Health Connect permissions — see [Metrics synced](#metrics-synced) below
+   for the full list. Health Connect shows this as two screens, not one: the main per-category
+   grant, then a second "Allow additional access" screen for two special permissions (access
+   past data beyond the normal 30-day-from-grant window, and access data in the background so
+   the nightly sync can actually read anything while the app isn't open) — grant both.
 3. The app syncs on launch and registers a background sync that runs **once a day, around
    2am local time** (`SyncWorker.schedulePeriodicSync`) — not on every widget refresh, to
    avoid battery drain from frequent background wakeups. You can also tap **Sync Now** any
@@ -129,31 +158,15 @@ On first launch:
    Once a day is already generous for step/HR/sleep/exercise data; if you'd rather sync every
    2-3 days instead, bump `SYNC_INTERVAL_DAYS` in `SyncWorker.kt`.
 
-Each install writes to its own file — `Ozzy_Samsung_Health_Sync.csv` or
-`Max_Samsung_Health_Sync.csv` — inside the shared `Wearable_Data` folder, so the two datasets
-never collide.
-
-### Installing on Max's phone
-
-Drive-side setup (service account, shared folder, placeholder CSVs) is shared and already
-done — it's a one-time thing for the whole setup, not per-phone. Max's phone just needs:
-
-1. Get `app-release.apk` onto the phone (however's convenient) and tap it to install.
-2. Open the app → tap **Max** on the owner picker.
-3. Grant Health Connect permissions when prompted (or tap **Sync Now** to trigger the prompt).
-4. Get the same service-account key file onto the phone and tap **Import Drive Key** to pick
-   it — same key file as Ozzy's phone, both installs share one service account.
-5. Confirm **"Last sync succeeded"** appears.
-
-No `adb` or USB debugging required anywhere in that list — steps 1 and 4 just need the two
-files (APK, key) to reach the phone by whatever channel is easiest (send them directly, don't
-use a public link for the key file, it's a credential).
+Repeat for every additional phone (same APK, same Drive key file, a different name typed in at
+step 1) — Drive-side setup (service account, shared folder, placeholder CSVs) only needs doing
+once for the whole household, not per phone.
 
 ### Reinstalling, or switching to a differently-signed build
 
 Safe. A reinstall (or moving from debug-signed to release-signed, which Android treats as a
-different app and requires a full uninstall first) wipes local app storage — owner choice,
-sync cursor, cached Drive file ID. The next sync after that re-reads Health Connect's full
+different app and requires a full uninstall first) wipes local app storage — the entered name,
+sync cursors, cached Drive file IDs. The next sync after that re-reads Health Connect's full
 retention window from scratch, same as a true fresh install. That's expected, not a bug: before
 re-uploading, `DriveUploader` reads the existing Drive file's `source_record_id` column and
 filters out anything already present, so re-synced rows that were already uploaded get silently
@@ -162,8 +175,7 @@ added exactly the rows that were genuinely new since the last sync, zero duplica
 
 ## Metrics synced
 
-Expanded well past the design doc's original four (steps, heart rate, sleep, exercise) —
-current rule: if Health Connect exposes it behind a plain read permission and it reduces to a
+Current rule: if Health Connect exposes it behind a plain read permission and it reduces to a
 scalar value per row, it's in; if it needs a real custom parser or an extra sensitive
 permission beyond the normal grant, it's out. See `HealthConnectReader.kt` for the exact
 mapping and reasoning inline.
@@ -182,32 +194,22 @@ rate, resting heart rate, HRV, oxygen saturation, respiratory rate, body/basal t
 blood glucose, VO2 max, speed, power, cycling cadence, steps cadence).
 
 **Not aggregated — one row per record, point-in-time** (weight, height, body fat %, bone mass,
-lean body mass, basal metabolic rate, **blood pressure**) — a scale reading, or a blood
-pressure check, is a deliberate spot measurement, not a rate to smooth over a day. Blood
-pressure was originally grouped with the aggregated metrics above on the assumption it'd need
-the same noise-reduction treatment as something like heart rate; real data (once
-[the Samsung Health Monitor import](#blood-pressure-import-samsung-health-monitor) existed to
-actually produce some, since Health Connect never has any on its own — see that section) showed
-2-3 deliberate readings a day, not hundreds of continuous samples, so it moved here instead.
+lean body mass, basal metabolic rate, **blood pressure**, **exercise sessions**) — a scale
+reading, a blood pressure check, or a single workout, is a deliberate discrete event, not a
+rate to smooth over a day. Exercise sessions carry the session's real Health Connect record ID,
+title/notes (when present), and the min/avg/max heart rate recorded during that session's time
+window, cross-referenced from the heart-rate stream separately.
 
 A day (or sleep day) is only synced once it's actually over — see "Behavior note" below.
 
 **Left out on purpose:**
-- **Samsung's proprietary body-composition metrics from the watch's BIA sensor** (skeletal
-  muscle mass, body fat % *as measured by the watch specifically*, BMI) **and the continuous
-  stress score** — these do not pass through Health Connect at all, cloud-only inside Samsung
-  Health / Samsung Account, a hard Samsung platform restriction with no workaround. Keep
-  exporting those manually. This is distinct from the `body_fat`/`weight`/etc. metrics above,
-  which read whatever *any* device writes through Health Connect's standard API (a smart scale,
-  for instance) — those work fine, the wall is specifically Samsung's sensor pipeline, not the
-  metric itself.
 - **Exercise GPS routes** — needs the separate, more sensitive `PERMISSION_READ_EXERCISE_ROUTES`
   consent rather than a normal read grant.
 - **Full nutrition logging** — `NutritionRecord` has 30+ optional nutrient fields; doesn't
   reduce to a scalar-per-row without real custom mapping code.
 - **Reproductive health** (menstruation, ovulation, sexual activity, etc.) — mechanically just
-  as easy to add as anything else here, but not applicable to this app's two named users, and
-  would bloat the permission consent screen with irrelevant categories.
+  as easy to add as anything else here, left out to keep the permission consent screen focused;
+  add it yourself in `HealthConnectReader.kt`/`AndroidManifest.xml` if you want it.
 
 ### Behavior note: daily aggregation changes what "Sync Now" does
 
@@ -223,7 +225,29 @@ Timestamps on daily-aggregated rows use the local calendar date encoded as UTC m
 same date string — deliberately not a true timezone conversion, so `timestamp_utc`'s date
 portion always matches the day a human actually experienced rather than a UTC-shifted one.
 
-## Blood pressure import (Samsung Health Monitor)
+## Samsung Health full-data export import (optional, Samsung-only)
+
+Several Samsung Health metrics never reach Health Connect at all — Samsung computes them purely
+internally (for its Energy Score / Sleep Score features) and never writes the underlying values
+out through the platform's standard record types: **heart rate variability, respiratory rate,
+stress score, advanced glycation end-products (AGE), post-exercise heart-rate recovery, skin
+temperature, and custom exercise names**. The only way back in is Samsung Health's own full
+personal-data export (**Samsung Health app → Settings → Download personal data**, not Samsung
+Health Monitor's PDF share used for blood pressure below).
+
+**How to use it:** request the export from within Samsung Health (it can take a while to
+prepare and lands as a zip in your phone's Downloads); once you have it, extract it somewhere
+the app can browse to, then tap **Connect Samsung Health Export Folder** in HealthSync and grant
+folder access via the system picker. From then on, every sync scans that folder for a fresh
+export and stages whatever new data it finds — safe to leave connected permanently; re-running
+the export periodically (it's a full re-dump of your entire history every time, not
+incremental) just gets picked up and deduplicated automatically via a per-metric cursor, same
+as everything else in this app.
+
+If you're not on Samsung, or don't care about these specific metrics, skip this entirely — the
+rest of the app works exactly the same without it.
+
+## Blood pressure import (Samsung Health Monitor, optional, Samsung-only)
 
 Samsung Health Monitor — the separate app used for Galaxy Watch blood pressure readings — never
 publishes that data to Health Connect at all, on any Samsung Health/Health Monitor version.
@@ -249,14 +273,13 @@ doesn't upload directly: it stages the parsed rows locally (`PendingImports`) an
 One code path talks to Drive in this app, not two that could quietly drift apart.
 
 **One row per reading, not aggregated** — same point-in-time treatment as weight/height/etc.
-above (see that section for why blood pressure specifically belongs there), producing its own
-`blood_pressure_pulse` metric alongside `blood_pressure_systolic`/`blood_pressure_diastolic` —
-deliberately not folded into the general `heart_rate` metric, since a pulse taken during a BP
-measurement isn't the same clinical context as continuous or exercise heart rate. Because each
-reading is its own row with its own timestamp, there's no "today isn't finished yet" concern
-the way there is for this file's daily-aggregated metrics — nothing to protect against
-finalizing an incomplete bucket too early, so every reading in an export uploads immediately,
-including today's.
+above, producing its own `blood_pressure_pulse` metric alongside
+`blood_pressure_systolic`/`blood_pressure_diastolic` — deliberately not folded into the general
+`heart_rate` metric, since a pulse taken during a BP measurement isn't the same clinical
+context as continuous or exercise heart rate. Because each reading is its own row with its own
+timestamp, there's no "today isn't finished yet" concern the way there is for this file's
+daily-aggregated metrics — nothing to protect against finalizing an incomplete bucket too
+early, so every reading in an export uploads immediately, including today's.
 
 **Duplicate handling across exports — the normal case, not an edge case:** Health Monitor's own
 export windows (1 week, 2 weeks, last month, last 3 months, year to date) all overlap each
@@ -278,14 +301,14 @@ duplicate, since nothing outside that window was ever in the file to begin with.
 
 ## Verifying it worked
 
-All of the below has actually been run end-to-end against a real phone and a real Drive
-folder, not just reasoned about — see commit history for what broke and got fixed along the
-way.
-
-- Fresh install → pick owner → import key → grant permissions → sync → the CSV shows up in
-  `File Archive/Health/Wearable_Data/<Owner>_Samsung_Health_Sync.csv` with rows shaped like
+- Fresh install → enter a name → import key → grant permissions → sync → the CSV shows up in
+  your `Wearable_Data` Drive folder as `<Name>_Samsung_Health_Sync.csv` with rows shaped like
   `timestamp_utc,owner,metric,value,unit,source_record_id`, header included.
 - A second sync with no new Health Connect data appends nothing and doesn't error.
 - A second sync with new data appends only the new rows (cursor-based — see `SyncState.kt`).
 - Reinstalling and re-syncing doesn't duplicate old rows — see "Reinstalling, or switching to a
   differently-signed build" above for how that's guaranteed even with the cursor gone.
+
+## License
+
+[MIT](LICENSE).

@@ -91,4 +91,38 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Grants one-time SAF access to wherever Samsung Health's own full-data-export lands
+         (Downloads/Samsung Health/samsunghealth_...). HRV and respiratory rate never reach
+         Health Connect at all, so this folder is the only way in for those two. Hidden once a
+         folder's been picked, same visibility pattern as button_import_key. -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/button_connect_export_folder"
+        style="@style/Widget.MaterialComponents.Button.TextButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/button_connect_export_folder"
+        app:layout_constraintTop_toBottomOf="@id/button_resync_history"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Persistent, per-source problem list, distinct from text_status above, which only ever
+         reflects the *most recent* sync attempt as a whole. A single metric type failing to
+         parse (Samsung changed an export's format, Health Connect has a corrupted stored record)
+         is deliberately isolated so it can't fail the overall sync, which means text_status can
+         say SUCCESS on every subsequent run even though that one metric has been silently broken
+         and un-synced the whole time. This shows every such outstanding problem, keyed by the
+         source that's actually broken, and each entry only disappears once that specific source
+         succeeds again, not just because a new sync ran. Hidden entirely when nothing's wrong. -->
+    <TextView
+        android:id="@+id/text_source_warnings"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:textColor="#B00020"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/button_connect_export_folder"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>

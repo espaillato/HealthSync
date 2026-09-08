@@ -133,9 +133,9 @@ data class CsvRow(
  * users and would otherwise bloat the permission consent screen with irrelevant categories.
  *
  * Everything except point-in-time body measurements (weight, height, body fat, bone mass, lean
- * body mass, basal metabolic rate, blood pressure -- deliberate spot readings, a handful a day,
- * not dense enough to need smoothing) is aggregated to one local calendar day per row -- sums
- * for additive metrics (steps, distance, calories, sleep-stage minutes, exercise minutes, ...),
+ * body mass, basal metabolic rate, blood pressure, exercise sessions -- deliberate spot readings
+ * or discrete events, not dense enough to need smoothing) is aggregated to one local calendar
+ * day per row -- sums for additive metrics (steps, distance, calories, sleep-stage minutes, ...),
  * and min/avg/max for genuinely fluctuating ones (heart rate, speed/power/cadence, ...). Sleep
  * specifically buckets by a noon-to-noon "sleep day" instead (see [sleepDayOf]) -- sessions
  * normally cross midnight, so calendar-day bucketing would routinely split or misattribute a
@@ -152,24 +152,39 @@ data class CsvRow(
  * -- a calendar day is done at midnight, but a sleep day isn't done until noon the next day, so a
  * sync that ran right after midnight and one that ran mid-afternoon need to agree on what's safe
  * to emit without needing two different query windows to get there.
+ *
+ * **Cursor model (changed 2026-09-07):** each Health Connect record type tracks its own
+ * independent cursor (see [SyncState.healthConnectCursor]) rather than one shared value across
+ * everything. Real, confirmed-live motivation: `StepsRecord` hit Health Connect's own
+ * corrupt-stored-record bug (see [readAllPages]) twice on one account, each time stalling for
+ * about 5 days under the old shared-cursor design before *other* record types succeeding
+ * happened to drag the shared cursor far enough forward for Steps to clear on its own. A shared
+ * cursor cuts both ways, though: it's also what would let one record type's success silently
+ * drag a *different*, still-failing record type's cursor forward past data it never actually
+ * read, which on a first-ever sync or a "Resync Full History" tap (a multi-week query window,
+ * not one day) could silently skip a large stretch of that metric's history in a single jump.
+ * Per-record-type cursors avoid both failure modes: no cross-metric contamination in either
+ * direction, and [readAllPages] guarantees forward progress (one day at a time, from whatever
+ * reference point is available) on every failed attempt, so a stuck metric can't stay stuck
+ * forever either.
  */
 class HealthConnectReader(private val context: Context) {
 
     private val client by lazy { HealthConnectClient.getOrCreate(context) }
+    private val syncState by lazy { SyncState(context) }
 
     suspend fun hasAllPermissions(): Boolean =
         client.permissionController.getGrantedPermissions().containsAll(REQUIRED_PERMISSIONS)
 
     /**
-     * The most recent instant it's safe to advance the sync cursor to: the more conservative of
+     * The most recent instant it's safe to advance a cursor to: the more conservative of
      * "start of today" (the boundary for every calendar-day-bucketed metric) and "start of the
      * current, still-in-progress sleep day" (noon-to-noon, see [sleepDayOf]). Always safe to use
      * as a cursor -- never past a boundary that could still receive more data -- but sometimes
      * more conservative than strictly necessary (e.g. calendar-day metrics could technically
      * advance further before noon, when sleep is the binding constraint). The cost of that slack
-     * is a bit of redundant local re-scanning on the next sync, which the dedup backstop in
-     * DriveUploader makes harmless; the alternative would be a separate cursor per metric type,
-     * not worth the complexity for what this saves.
+     * is a bit of redundant local re-scanning on the next sync for metrics unaffected by sleep's
+     * boundary, which the dedup backstop in DriveUploader makes harmless.
      */
     fun safeCursorBoundary(): Instant {
         val zone = ZoneId.systemDefault()
@@ -179,86 +194,120 @@ class HealthConnectReader(private val context: Context) {
     }
 
     /**
-     * Reads all in-scope records with an end time after [since] (or all retained history if
-     * null) up to [until], flattened into CSV rows tagged with [owner]. Queries as fresh as
-     * [until] allows, but only ever emits rows for days (or sleep days) that are actually
-     * complete as of *now* -- a still-forming today's/current-sleep-day's data gets read from
-     * Health Connect same as anything else, then silently dropped before aggregation, rather
-     * than excluded by narrowing the query window. That split matters: it's what lets a sync
-     * running at any time of day correctly pick up whatever has newly become complete since the
-     * last one, without needing the query window and the completeness boundary to be the same
-     * thing (they aren't, for sleep -- see [sleepDayOf]).
+     * Reads all in-scope records up to [until], flattened into CSV rows tagged with [owner].
+     * Each record type queries from its own independently-persisted cursor (see class doc) up to
+     * [until], but only ever emits rows for days (or sleep days) that are actually complete as of
+     * *now* -- a still-forming today's/current-sleep-day's data gets read from Health Connect
+     * same as anything else, then silently dropped before aggregation, rather than excluded by
+     * narrowing the query window. That split matters: it's what lets a sync running at any time
+     * of day correctly pick up whatever has newly become complete since the last one, without
+     * needing the query window and the completeness boundary to be the same thing (they aren't,
+     * for sleep -- see [sleepDayOf]).
      */
-    suspend fun readSince(since: Instant?, until: Instant, owner: String): List<CsvRow> {
-        // Health Connect's TimeRangeFilter requires a strictly-after end time -- since == until
-        // is not just "empty", it's rejected outright. Guards the degenerate case (e.g. two
-        // syncs firing back to back); in practice `since` is always some past cursor and `until`
-        // is the current instant, so this rarely trips.
-        if (since != null && !since.isBefore(until)) return emptyList()
-        val range = TimeRangeFilter.between(since ?: Instant.EPOCH, until)
+    suspend fun readSince(until: Instant, owner: String): List<CsvRow> {
         val rows = mutableListOf<CsvRow>()
 
+        // Fetched once, reused below by more than one metric -- SleepSessionRecord by both
+        // readSleep and readSleepHeartRate, ExerciseSessionRecord by readExercise alone but kept
+        // to the same "fetch once, pass down" style, HeartRateRecord by the plain daily
+        // heart_rate aggregation, readSleepHeartRate, and readExercise -- rather than querying
+        // Health Connect for the same data more than once for each.
+        val sleepSessions = readAllPages(SleepSessionRecord::class, until) { it.endTime }
+        val exerciseSessions = readAllPages(ExerciseSessionRecord::class, until) { it.endTime }
+        val heartRateSamples = readAllPages(HeartRateRecord::class, until) { it.endTime }
+            .flatMap { r -> r.samples.map { it.time to it.beatsPerMinute.toDouble() } }
+
         // Activity -- additive, one summed row per local day
-        rows += readSumDaily(range, owner, StepsRecord::class, "steps", "count", asCount = true, endTime = { it.endTime }) { it.count.toDouble() }
-        rows += readSleep(range, owner)
-        rows += readExercise(range, owner)
-        rows += readSumDaily(range, owner, DistanceRecord::class, "distance", "meters", endTime = { it.endTime }) { it.distance.inMeters }
-        rows += readSumDaily(range, owner, ElevationGainedRecord::class, "elevation_gained", "meters", endTime = { it.endTime }) { it.elevation.inMeters }
-        rows += readSumDaily(range, owner, FloorsClimbedRecord::class, "floors_climbed", "floors", asCount = true, endTime = { it.endTime }) { it.floors }
-        rows += readSumDaily(range, owner, ActiveCaloriesBurnedRecord::class, "active_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
-        rows += readSumDaily(range, owner, TotalCaloriesBurnedRecord::class, "total_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
-        rows += readSumDaily(range, owner, WheelchairPushesRecord::class, "wheelchair_pushes", "count", asCount = true, endTime = { it.endTime }) { it.count.toDouble() }
-        rows += readSumDaily(range, owner, HydrationRecord::class, "hydration", "liters", endTime = { it.endTime }) { it.volume.inLiters }
+        rows += readSumDaily(until, owner, StepsRecord::class, "steps", "count", asCount = true, endTime = { it.endTime }) { it.count.toDouble() }
+        rows += readSleep(sleepSessions, owner)
+        rows += readSleepHeartRate(sleepSessions, owner, heartRateSamples)
+        rows += readExercise(exerciseSessions, owner, heartRateSamples)
+        rows += readSumDaily(until, owner, DistanceRecord::class, "distance", "meters", endTime = { it.endTime }) { it.distance.inMeters }
+        rows += readSumDaily(until, owner, ElevationGainedRecord::class, "elevation_gained", "meters", endTime = { it.endTime }) { it.elevation.inMeters }
+        rows += readSumDaily(until, owner, FloorsClimbedRecord::class, "floors_climbed", "floors", asCount = true, endTime = { it.endTime }) { it.floors }
+        rows += readSumDaily(until, owner, ActiveCaloriesBurnedRecord::class, "active_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
+        rows += readSumDaily(until, owner, TotalCaloriesBurnedRecord::class, "total_calories_burned", "kcal", endTime = { it.endTime }) { it.energy.inKilocalories }
+        rows += readSumDaily(until, owner, WheelchairPushesRecord::class, "wheelchair_pushes", "count", asCount = true, endTime = { it.endTime }) { it.count.toDouble() }
+        rows += readSumDaily(until, owner, HydrationRecord::class, "hydration", "liters", endTime = { it.endTime }) { it.volume.inLiters }
 
         // Vitals -- fluctuating, daily min/avg/max
-        rows += readAggregatedDaily(range, owner, HeartRateRecord::class, "heart_rate", "bpm") { r -> r.samples.map { it.time to it.beatsPerMinute.toDouble() } }
-        rows += readStatsDaily(range, owner, RestingHeartRateRecord::class, "resting_heart_rate", "bpm", time = { it.time }) { it.beatsPerMinute.toDouble() }
-        rows += readStatsDaily(range, owner, HeartRateVariabilityRmssdRecord::class, "heart_rate_variability_rmssd", "ms", time = { it.time }) { it.heartRateVariabilityMillis }
-        rows += readStatsDaily(range, owner, OxygenSaturationRecord::class, "oxygen_saturation", "percent", time = { it.time }) { it.percentage.value }
-        rows += readStatsDaily(range, owner, RespiratoryRateRecord::class, "respiratory_rate", "breaths_per_min", time = { it.time }) { it.rate }
-        rows += readStatsDaily(range, owner, BodyTemperatureRecord::class, "body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
-        rows += readStatsDaily(range, owner, BasalBodyTemperatureRecord::class, "basal_body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
-        rows += readStatsDaily(range, owner, BloodGlucoseRecord::class, "blood_glucose", "mg_per_dL", time = { it.time }) { it.level.inMilligramsPerDeciliter }
-        rows += readStatsDaily(range, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
+        rows += aggregateSamplesDaily(owner, "heart_rate", "bpm", heartRateSamples)
+        rows += readStatsDaily(until, owner, RestingHeartRateRecord::class, "resting_heart_rate", "bpm", time = { it.time }) { it.beatsPerMinute.toDouble() }
+        rows += readStatsDaily(until, owner, HeartRateVariabilityRmssdRecord::class, "heart_rate_variability_rmssd", "ms", time = { it.time }) { it.heartRateVariabilityMillis }
+        rows += readStatsDaily(until, owner, OxygenSaturationRecord::class, "oxygen_saturation", "percent", time = { it.time }) { it.percentage.value }
+        rows += readStatsDaily(until, owner, RespiratoryRateRecord::class, "respiratory_rate", "breaths_per_min", time = { it.time }) { it.rate }
+        rows += readStatsDaily(until, owner, BodyTemperatureRecord::class, "body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
+        rows += readStatsDaily(until, owner, BasalBodyTemperatureRecord::class, "basal_body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
+        rows += readStatsDaily(until, owner, BloodGlucoseRecord::class, "blood_glucose", "mg_per_dL", time = { it.time }) { it.level.inMilligramsPerDeciliter }
+        rows += readStatsDaily(until, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
 
         // Body measurements -- point-in-time, not aggregated. Not from the Samsung watch (its
         // BIA sensor doesn't pass through Health Connect at all, per the design doc), but a
         // smart scale or other device writing standard Health Connect records for these is just
         // as easy to read as anything else.
         //
-        // Blood pressure lives here too, not with the dense fluctuating metrics below --
+        // Blood pressure lives here too, not with the dense fluctuating metrics above --
         // originally grouped with heart rate/speed/etc. on the assumption that it'd need the
         // same noise-reduction treatment, but real data (once the Samsung Health Monitor import
         // existed to actually produce some, see SamsungHealthMonitorPdfImporter) showed 2-3
         // deliberate spot readings a day, not hundreds of continuous samples. Aggregating that
         // into a daily average would blur exactly the individual readings someone would
         // actually want to see, for noise-reduction benefit that was never really there.
-        rows += readBloodPressure(range, owner)
-        rows += readScalarInstant(range, owner, WeightRecord::class, "weight", "kg", time = { it.time }) { it.weight.inKilograms }
-        rows += readScalarInstant(range, owner, HeightRecord::class, "height", "meters", time = { it.time }) { it.height.inMeters }
-        rows += readScalarInstant(range, owner, BodyFatRecord::class, "body_fat", "percent", time = { it.time }) { it.percentage.value }
-        rows += readScalarInstant(range, owner, BoneMassRecord::class, "bone_mass", "kg", time = { it.time }) { it.mass.inKilograms }
-        rows += readScalarInstant(range, owner, LeanBodyMassRecord::class, "lean_body_mass", "kg", time = { it.time }) { it.mass.inKilograms }
-        rows += readScalarInstant(range, owner, BasalMetabolicRateRecord::class, "basal_metabolic_rate", "kcal_per_day", time = { it.time }) { it.basalMetabolicRate.inKilocaloriesPerDay }
+        rows += readBloodPressure(until, owner)
+        rows += readScalarInstant(until, owner, WeightRecord::class, "weight", "kg", time = { it.time }) { it.weight.inKilograms }
+        rows += readScalarInstant(until, owner, HeightRecord::class, "height", "meters", time = { it.time }) { it.height.inMeters }
+        rows += readScalarInstant(until, owner, BodyFatRecord::class, "body_fat", "percent", time = { it.time }) { it.percentage.value }
+        rows += readScalarInstant(until, owner, BoneMassRecord::class, "bone_mass", "kg", time = { it.time }) { it.mass.inKilograms }
+        rows += readScalarInstant(until, owner, LeanBodyMassRecord::class, "lean_body_mass", "kg", time = { it.time }) { it.mass.inKilograms }
+        rows += readScalarInstant(until, owner, BasalMetabolicRateRecord::class, "basal_metabolic_rate", "kcal_per_day", time = { it.time }) { it.basalMetabolicRate.inKilocaloriesPerDay }
 
         // Dense sample-based interval records -- same daily min/avg/max treatment as heart
         // rate, for the same reason: continuous sampling during workouts would otherwise be by
         // far the dominant row source.
-        rows += readAggregatedDaily(range, owner, SpeedRecord::class, "speed", "m_per_s") { r -> r.samples.map { it.time to it.speed.inMetersPerSecond } }
-        rows += readAggregatedDaily(range, owner, PowerRecord::class, "power", "watts") { r -> r.samples.map { it.time to it.power.inWatts } }
-        rows += readAggregatedDaily(range, owner, CyclingPedalingCadenceRecord::class, "cycling_cadence", "rpm") { r -> r.samples.map { it.time to it.revolutionsPerMinute } }
-        rows += readAggregatedDaily(range, owner, StepsCadenceRecord::class, "steps_cadence", "steps_per_min") { r -> r.samples.map { it.time to it.rate } }
+        rows += readAggregatedDaily(until, owner, SpeedRecord::class, "speed", "m_per_s", recordTime = { it.endTime }) { r -> r.samples.map { it.time to it.speed.inMetersPerSecond } }
+        rows += readAggregatedDaily(until, owner, PowerRecord::class, "power", "watts", recordTime = { it.endTime }) { r -> r.samples.map { it.time to it.power.inWatts } }
+        rows += readAggregatedDaily(until, owner, CyclingPedalingCadenceRecord::class, "cycling_cadence", "rpm", recordTime = { it.endTime }) { r -> r.samples.map { it.time to it.revolutionsPerMinute } }
+        rows += readAggregatedDaily(until, owner, StepsCadenceRecord::class, "steps_cadence", "steps_per_min", recordTime = { it.endTime }) { r -> r.samples.map { it.time to it.rate } }
 
         return rows
     }
 
-    private suspend fun <T : Record> readAllPages(recordType: KClass<T>, range: TimeRangeFilter): List<T> {
+    /**
+     * Pages through every record of [recordType] from that record type's own persisted cursor
+     * (see [SyncState.healthConnectCursor]) up to [until]. [timestampOf] extracts each record's
+     * own natural reference timestamp -- needed to compute where to advance this record type's
+     * cursor to, both on success and (see below) on failure.
+     */
+    private suspend fun <T : Record> readAllPages(recordType: KClass<T>, until: Instant, timestampOf: (T) -> Instant): List<T> {
+        val sourceKey = recordType.simpleName ?: "UnknownRecordType"
+        val since = syncState.healthConnectCursor(sourceKey)
+        // Health Connect's TimeRangeFilter requires a strictly-after end time -- since == until
+        // is not just "empty", it's rejected outright. Guards the degenerate case (e.g. two
+        // syncs firing back to back, or a cursor that's already caught all the way up to `until`
+        // from a previous forced-forward advance); in practice this rarely trips.
+        if (since != null && !since.isBefore(until)) return emptyList()
+        val range = TimeRangeFilter.between(since ?: Instant.EPOCH, until)
+
         val all = mutableListOf<T>()
         var pageToken: String? = null
         do {
             val response = try {
                 client.readRecords(
-                    ReadRecordsRequest(recordType = recordType, timeRangeFilter = range, pageToken = pageToken)
+                    // pageSize deliberately far below the library's own default (confirmed via
+                    // decompiling: 1000) -- Health Connect's page-conversion failure is
+                    // page-atomic, not record-atomic (confirmed live: the stack trace throws
+                    // deep inside converting the whole page's response, before this function
+                    // ever gets a chance to add anything from that page to `all`), so one
+                    // corrupted record doesn't just cost itself, it costs everything else that
+                    // happened to share its page. At the default page size, a dense metric like
+                    // Steps (~80 records/day) can lose ~12+ days of perfectly good data to a
+                    // single bad record in one shot -- directly why the forced-forward reference
+                    // below can fall all the way back to this attempt's starting cursor instead
+                    // of landing much closer to the actual bad record. A much smaller page
+                    // shrinks that blast radius to roughly a day or so for a metric that dense,
+                    // at the cost of a few more (cheap, local) round trips through this loop for
+                    // the ordinary all-pages-succeed case.
+                    ReadRecordsRequest(recordType = recordType, timeRangeFilter = range, pageToken = pageToken, pageSize = 100)
                 )
             } catch (e: Exception) {
                 // Health Connect's own client can throw while deserializing a record that's
@@ -270,16 +319,37 @@ class HealthConnectReader(private val context: Context) {
                 // that record type aborts. Caught here rather than at the readSince level so it
                 // can't take the entire sync down: readAllPages runs once per record type, so
                 // one corrupted metric fails on its own and every other metric in the same sync
-                // still succeeds normally. Logged loudly (not silently dropped) since this exact
-                // record type will keep failing every sync until either the query window
-                // advances past the bad record's timestamp or the record itself gets fixed at
-                // the source.
-                Log.w(TAG, "readRecords failed for ${recordType.simpleName}, skipping this metric for this sync", e)
-                break
+                // still succeeds normally. Logged loudly (not silently dropped), and persisted
+                // via SyncState.setSourceError so it's visible in the app's UI too, not just
+                // logcat.
+                Log.w(TAG, "readRecords failed for $sourceKey, skipping this metric for this sync", e)
+                syncState.setSourceError(
+                    sourceKey,
+                    "Health Connect couldn't read this record type (${e.message ?: e.javaClass.simpleName}) -- " +
+                        "likely a corrupted stored record. Other metrics are unaffected; this one will keep " +
+                        "advancing a day at a time past it automatically."
+                )
+                // Guaranteed forward progress on every failed attempt, one day at a time, rather
+                // than either freezing here forever (a literal corrupted record blocks this exact
+                // spot permanently -- see class doc) or jumping all the way to `until`/now in one
+                // shot (which is what a shared cursor did, and which risks silently skipping
+                // weeks of this one metric's history in a single jump on a large first-time
+                // backfill). The reference point is whatever's most specific and available:
+                // the latest record this attempt *did* manage to read before hitting the bad
+                // one, else the cursor this attempt started from, else the very beginning of
+                // time for a record type that's never synced anything at all yet. Capped at
+                // safeCursorBoundary() so a failure can never push a cursor into "today"/the
+                // still-forming sleep day, same safety rule the success path already follows.
+                val reference = all.maxOfOrNull(timestampOf) ?: since ?: Instant.EPOCH
+                val forcedCursor = minOf(reference.plus(Duration.ofDays(1)), safeCursorBoundary())
+                syncState.setHealthConnectCursor(sourceKey, forcedCursor)
+                return all
             }
             all += response.records
             pageToken = response.pageToken
         } while (!pageToken.isNullOrEmpty())
+        syncState.clearSourceError(sourceKey)
+        syncState.setHealthConnectCursor(sourceKey, safeCursorBoundary())
         return all
     }
 
@@ -291,7 +361,7 @@ class HealthConnectReader(private val context: Context) {
      * library-internal, not part of the public API surface.
      */
     private suspend fun <T : Record> readScalarInstant(
-        range: TimeRangeFilter,
+        until: Instant,
         owner: String,
         recordType: KClass<T>,
         metric: String,
@@ -299,13 +369,13 @@ class HealthConnectReader(private val context: Context) {
         time: (T) -> Instant,
         value: (T) -> Double,
     ): List<CsvRow> =
-        readAllPages(recordType, range).map { r ->
+        readAllPages(recordType, until, time).map { r ->
             CsvRow(time(r), owner, metric, formatValue(value(r)), unit, r.metadata.id)
         }
 
     /** Additive interval metrics (steps, distance, calories, ...): one summed row per local day. */
     private suspend fun <T : Record> readSumDaily(
-        range: TimeRangeFilter,
+        until: Instant,
         owner: String,
         recordType: KClass<T>,
         metric: String,
@@ -314,7 +384,7 @@ class HealthConnectReader(private val context: Context) {
         endTime: (T) -> Instant,
         value: (T) -> Double,
     ): List<CsvRow> {
-        val byDay = readAllPages(recordType, range).groupBy { localDayOf(endTime(it)) }
+        val byDay = readAllPages(recordType, until, endTime).groupBy { localDayOf(endTime(it)) }
         return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.map { (day, records) ->
             val total = records.sumOf(value)
             CsvRow(day.asTimestamp(), owner, metric, formatSum(total, asCount), unit, "${metric}_daily_$day")
@@ -323,7 +393,7 @@ class HealthConnectReader(private val context: Context) {
 
     /** Fluctuating scalar-instant metrics (SpO2, respiratory rate, ...): daily min/avg/max. */
     private suspend fun <T : Record> readStatsDaily(
-        range: TimeRangeFilter,
+        until: Instant,
         owner: String,
         recordType: KClass<T>,
         metricPrefix: String,
@@ -331,7 +401,7 @@ class HealthConnectReader(private val context: Context) {
         time: (T) -> Instant,
         value: (T) -> Double,
     ): List<CsvRow> {
-        val byDay = readAllPages(recordType, range).groupBy { localDayOf(time(it)) }
+        val byDay = readAllPages(recordType, until, time).groupBy { localDayOf(time(it)) }
         return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.flatMap { (day, records) ->
             dailyMinAvgMaxRows(day, owner, metricPrefix, unit, records.map(value))
         }
@@ -340,21 +410,27 @@ class HealthConnectReader(private val context: Context) {
     /**
      * Dense sample-based interval records (heart rate, speed, power, cadence): daily min/avg/max
      * over every raw sample in the day, not just one value per record -- a single interval
-     * record can span hours and contain hundreds of samples.
+     * record can span hours and contain hundreds of samples. [recordTime] is separate from
+     * [samplesOf] -- it's the record's own natural timestamp for cursor purposes (see
+     * [readAllPages]), not one of its individual samples.
      */
     private suspend fun <T : Record> readAggregatedDaily(
-        range: TimeRangeFilter,
+        until: Instant,
         owner: String,
         recordType: KClass<T>,
         metricPrefix: String,
         unit: String,
+        recordTime: (T) -> Instant,
         samplesOf: (T) -> List<Pair<Instant, Double>>,
-    ): List<CsvRow> {
-        val byDay = readAllPages(recordType, range)
-            .flatMap(samplesOf)
-            .groupBy { localDayOf(it.first) }
-        return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.flatMap { (day, samples) ->
-            dailyMinAvgMaxRows(day, owner, metricPrefix, unit, samples.map { it.second })
+    ): List<CsvRow> = aggregateSamplesDaily(owner, metricPrefix, unit, readAllPages(recordType, until, recordTime).flatMap(samplesOf))
+
+    /** The day-bucketing/filtering/min-avg-max part of [readAggregatedDaily], split out so a
+     *  caller that already has samples in hand (heart rate, reused by [readSleepHeartRate] and
+     *  [readExercise] too) doesn't have to re-query Health Connect just to reuse this logic. */
+    private fun aggregateSamplesDaily(owner: String, metricPrefix: String, unit: String, samples: List<Pair<Instant, Double>>): List<CsvRow> {
+        val byDay = samples.groupBy { localDayOf(it.first) }
+        return byDay.entries.filter { isCompleteCalendarDay(it.key) }.sortedBy { it.key }.flatMap { (day, daySamples) ->
+            dailyMinAvgMaxRows(day, owner, metricPrefix, unit, daySamples.map { it.second })
         }
     }
 
@@ -414,9 +490,9 @@ class HealthConnectReader(private val context: Context) {
      * Connect's own record UUID). See the call site's comment for why this moved out of the
      * dense/fluctuating-metric bucket it started in.
      */
-    private suspend fun readBloodPressure(range: TimeRangeFilter, owner: String): List<CsvRow> {
+    private suspend fun readBloodPressure(until: Instant, owner: String): List<CsvRow> {
         val rows = mutableListOf<CsvRow>()
-        for (r in readAllPages(BloodPressureRecord::class, range)) {
+        for (r in readAllPages(BloodPressureRecord::class, until) { it.time }) {
             rows += CsvRow(r.time, owner, "blood_pressure_systolic", formatValue(r.systolic.inMillimetersOfMercury), "mmHg", "${r.metadata.id}#systolic")
             rows += CsvRow(r.time, owner, "blood_pressure_diastolic", formatValue(r.diastolic.inMillimetersOfMercury), "mmHg", "${r.metadata.id}#diastolic")
         }
@@ -430,8 +506,7 @@ class HealthConnectReader(private val context: Context) {
      * file (confirmed against real data: ~35 `sleep_stage_light` rows/day alone) for no
      * trend-relevant benefit over "total minutes of each stage that sleep day".
      */
-    private suspend fun readSleep(range: TimeRangeFilter, owner: String): List<CsvRow> {
-        val sessions = readAllPages(SleepSessionRecord::class, range)
+    private fun readSleep(sessions: List<SleepSessionRecord>, owner: String): List<CsvRow> {
         val rows = mutableListOf<CsvRow>()
 
         sessions.groupBy { sleepDayOf(it.endTime) }
@@ -459,6 +534,42 @@ class HealthConnectReader(private val context: Context) {
         return rows
     }
 
+    /**
+     * Heart rate specifically *during sleep*, not the whole calendar day's range like the plain
+     * `heart_rate_*` metric -- this device never exposes a distinct resting-heart-rate figure at
+     * all (Samsung computed it internally and, as of a recent update, dropped even the on-screen
+     * display of it -- confirmed 2026-08-23, not present in the full-data export either). Sleep
+     * HR is the standard fallback several other wearable platforms use as their own definition
+     * of "resting heart rate" in the first place, and arguably a *better* one than a discrete
+     * post-wake reading: `_min` specifically is the closer analog to genuine physiological rest,
+     * since `_avg` still gets pulled up by REM-stage elevations and brief arousals across a
+     * night. Both are kept, same as every other min/avg/max metric here, rather than picking one
+     * and discarding the rest.
+     *
+     * Takes [sessions] and [heartRateSamples] as already-fetched lists rather than querying
+     * Health Connect itself -- both record types are also needed elsewhere in [readSince]
+     * ([SleepSessionRecord] by [readSleep], [HeartRateRecord] by the plain `heart_rate`
+     * aggregation), so fetching each once and passing it to every caller that needs it avoids
+     * querying Health Connect twice for the same data.
+     */
+    private fun readSleepHeartRate(sessions: List<SleepSessionRecord>, owner: String, heartRateSamples: List<Pair<Instant, Double>>): List<CsvRow> {
+        if (sessions.isEmpty() || heartRateSamples.isEmpty()) return emptyList()
+        val hrSamples = heartRateSamples.sortedBy { it.first }
+
+        val byDay = mutableMapOf<LocalDate, MutableList<Double>>()
+        for (session in sessions) {
+            val day = sleepDayOf(session.endTime)
+            if (!isCompleteSleepDay(day)) continue
+            val inSession = hrSamples.filter { it.first >= session.startTime && it.first <= session.endTime }
+            if (inSession.isEmpty()) continue
+            byDay.getOrPut(day) { mutableListOf() }.addAll(inSession.map { it.second })
+        }
+
+        return byDay.entries.sortedBy { it.key }.flatMap { (day, values) ->
+            dailyMinAvgMaxRows(day, owner, "sleep_heart_rate", "bpm", values)
+        }
+    }
+
     private fun stageTypeName(stageType: Int): String = when (stageType) {
         SleepSessionRecord.STAGE_TYPE_AWAKE -> "awake"
         SleepSessionRecord.STAGE_TYPE_AWAKE_IN_BED -> "awake_in_bed"
@@ -470,20 +581,52 @@ class HealthConnectReader(private val context: Context) {
         else -> "unknown"
     }
 
-    /** Exercise minutes summed per local day, per exercise type (two runs the same day -> one row). */
-    private suspend fun readExercise(range: TimeRangeFilter, owner: String): List<CsvRow> {
-        val minutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
-        for (r in readAllPages(ExerciseSessionRecord::class, range)) {
-            val day = localDayOf(r.endTime)
+    /**
+     * Point-in-time, one row group per session -- changed 2026-09-07 from the original
+     * daily-summed-minutes-per-type design. There typically aren't many exercise sessions in a
+     * day (unlike a dense sample stream), so summing them away loses more than it saves, and
+     * collapsing to one daily figure per type is exactly what stood in the way of the two things
+     * added alongside this change: a session's own heart-rate range, and its actual name.
+     *
+     * Heart rate specifically *during* this session -- not the whole day's `heart_rate_*` range,
+     * same reasoning as [readSleepHeartRate]: a workout's real min/avg/max gets diluted into
+     * meaninglessness once blended with every non-exercise hour that day.
+     *
+     * `title`/`notes` are real free-text fields on [ExerciseSessionRecord] (confirmed by
+     * decompiling the library) that were never captured before this -- exactly what turns a
+     * generic type code like `other_workout` back into a real session name (e.g. a custom
+     * bodyweight routine that has no matching built-in Health Connect exercise type). Only
+     * emitted when actually present and non-blank, same as every other optional field here.
+     */
+    private fun readExercise(sessions: List<ExerciseSessionRecord>, owner: String, heartRateSamples: List<Pair<Instant, Double>>): List<CsvRow> {
+        if (sessions.isEmpty()) return emptyList()
+        val hrSamples = heartRateSamples.sortedBy { it.first }
+        val rows = mutableListOf<CsvRow>()
+
+        for (session in sessions) {
+            val day = localDayOf(session.endTime)
             if (!isCompleteCalendarDay(day)) continue
-            val key = day to exerciseTypeName(r.exerciseType)
-            val minutes = Duration.between(r.startTime, r.endTime).toMinutes()
-            minutesByDayAndType.merge(key, minutes, Long::plus)
+            val id = session.metadata.id
+            val type = exerciseTypeName(session.exerciseType)
+            val minutes = Duration.between(session.startTime, session.endTime).toMinutes()
+            rows += CsvRow(session.startTime, owner, "exercise_$type", minutes.toString(), "minutes", id)
+
+            session.title?.takeIf { it.isNotBlank() }?.let {
+                rows += CsvRow(session.startTime, owner, "exercise_title", it, "text", "$id#title")
+            }
+            session.notes?.takeIf { it.isNotBlank() }?.let {
+                rows += CsvRow(session.startTime, owner, "exercise_notes", it, "text", "$id#notes")
+            }
+
+            val inSession = hrSamples.filter { it.first >= session.startTime && it.first <= session.endTime }
+            if (inSession.isNotEmpty()) {
+                val values = inSession.map { it.second }
+                rows += CsvRow(session.startTime, owner, "exercise_heart_rate_min", formatValue(values.min()), "bpm", "$id#hr_min")
+                rows += CsvRow(session.startTime, owner, "exercise_heart_rate_avg", formatValue(values.average()), "bpm", "$id#hr_avg")
+                rows += CsvRow(session.startTime, owner, "exercise_heart_rate_max", formatValue(values.max()), "bpm", "$id#hr_max")
+            }
         }
-        return minutesByDayAndType.entries.sortedBy { it.key.first }.map { (key, minutes) ->
-            val (day, type) = key
-            CsvRow(day.asTimestamp(), owner, "exercise_$type", minutes.toString(), "minutes", "exercise_${type}_daily_$day")
-        }
+        return rows
     }
 
     private fun exerciseTypeName(type: Int): String = when (type) {

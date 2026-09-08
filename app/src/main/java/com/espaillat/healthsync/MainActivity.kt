@@ -1,15 +1,20 @@
 package com.espaillat.healthsync
 
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.health.connect.client.PermissionController
 import androidx.lifecycle.lifecycleScope
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.espaillat.healthsync.databinding.ActivityMainBinding
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
@@ -21,6 +26,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var syncState: SyncState
     private lateinit var reader: HealthConnectReader
     private lateinit var driveUploader: DriveUploader
+    private var statusPollJob: Job? = null
 
     private val requestPermissions = registerForActivityResult(
         PermissionController.createRequestPermissionResultContract()
@@ -44,6 +50,19 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) importServiceAccountKey(uri)
     }
 
+    // Samsung Health's own full-data export lands in a fixed Downloads subfolder rather than
+    // being shared to a specific app, so this is a one-time folder grant (Storage Access
+    // Framework) instead of a share-target flow -- see SamsungHealthExportImporter's doc for why
+    // this is the only way to reach HRV/respiratory rate at all. The permission persisted here
+    // survives app restarts and reboots on its own; only the chosen folder's identity is stored.
+    private val pickExportFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            syncState.samsungHealthExportFolderUri = uri.toString()
+            refreshUi()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -56,11 +75,21 @@ class MainActivity : AppCompatActivity() {
         binding.buttonSyncNow.setOnClickListener { onSyncNowClicked(auto = false) }
         binding.buttonImportKey.setOnClickListener { importKey.launch(arrayOf("*/*")) }
         binding.buttonResyncHistory.setOnClickListener { onResyncHistoryClicked() }
+        binding.buttonConnectExportFolder.setOnClickListener { pickExportFolder.launch(null) }
 
         // Registers (or refreshes) the once-a-day background sync. Idempotent — safe to call
         // on every launch, see SyncWorker.schedulePeriodicSync.
         SyncWorker.schedulePeriodicSync(this)
 
+        // Kept as a low-latency bonus signal, not the sole source of truth for the status text
+        // anymore -- see onResume's poll loop below for why. Confirmed live, 2026-08-23: this
+        // LiveData observer does not reliably push every state transition while the app sits
+        // open and the user never triggers a fresh resume -- a sync could reach genuine SUCCESS
+        // (confirmed via WorkManager's own state directly) while this screen kept showing
+        // "Syncing…" indefinitely, only correcting itself once the user locked/unlocked the
+        // screen (an onResume) rather than on its own. Left in place since it usually does fire
+        // promptly and costs nothing extra when it does -- the poll loop is what guarantees
+        // correctness regardless of whether this fires or not.
         WorkManager.getInstance(this)
             .getWorkInfosForUniqueWorkLiveData(SyncWorker.MANUAL_WORK_NAME)
             .observe(this) { infos -> onWorkInfosChanged(infos) }
@@ -68,8 +97,39 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        refreshUi()
+        // Deliberately NOT a plain refreshUi() call here -- that was a real bug (confirmed live,
+        // 2026-08-23): it paints whatever sync result was persisted *before* this resume, with
+        // no idea whether a sync is actively running again right now (e.g. the screen was locked
+        // and unlocked while one was still mid-flight), so it could show a stale "last sync
+        // succeeded" from an earlier run while a brand new one was still genuinely in progress.
+        // Explicitly querying WorkManager's *current* state here and routing it through the
+        // exact same onWorkInfosChanged() decision the LiveData observer uses means onResume's
+        // very first paint is already correct, not dependent on that observer's own timing.
+        pollWorkInfo()
         onSyncNowClicked(auto = true)
+
+        // The LiveData observer above is a bonus, not a guarantee (see onCreate's doc) -- this
+        // loop is the actual fix for the screen getting stuck showing "Syncing…" after a sync
+        // has genuinely finished while the app just sits open with no fresh resume to trigger a
+        // recheck. Cheap (a local WorkManager/Room query, not network), so a few-second cadence
+        // costs nothing meaningful; cancelled in onPause so it never runs while backgrounded.
+        statusPollJob?.cancel()
+        statusPollJob = lifecycleScope.launch {
+            while (isActive) {
+                delay(4_000)
+                pollWorkInfo()
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        statusPollJob?.cancel()
+    }
+
+    private fun pollWorkInfo() {
+        val workInfoFuture = WorkManager.getInstance(this).getWorkInfosForUniqueWork(SyncWorker.MANUAL_WORK_NAME)
+        workInfoFuture.addListener({ onWorkInfosChanged(workInfoFuture.get()) }, ContextCompat.getMainExecutor(this))
     }
 
     private fun importServiceAccountKey(uri: Uri) {
@@ -104,13 +164,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Resets the cursor to null and re-syncs, so the next read starts from Health Connect's
-     * earliest retained data again instead of wherever the cursor happened to be. Needed
-     * whenever a newly-added metric type would otherwise only ever see data from the moment it
-     * was added onward: the cursor is shared across every metric, so it had already advanced
-     * past the new metric's entire history before that metric ever existed in the code. Safe to
-     * re-run anytime -- DriveUploader's source_record_id dedup backstop means already-uploaded
-     * days are silently skipped, not duplicated.
+     * Resets every Health Connect record type's own cursor (see [SyncState.healthConnectCursor])
+     * and re-syncs, so the next read starts from each one's earliest retained data again instead
+     * of wherever its cursor happened to be. Needed whenever a newly-added metric would
+     * otherwise only ever see data from the moment it was added onward: its own cursor wouldn't
+     * exist yet, but a *different*, already-cursored metric type reading fine wouldn't trigger a
+     * backfill for it either now that cursors are independent per record type (changed
+     * 2026-09-07) -- this button is the explicit way to force that backfill for everything at
+     * once. Safe to re-run anytime -- DriveUploader's source_record_id dedup backstop means
+     * already-uploaded days are silently skipped, not duplicated.
      */
     private fun onResyncHistoryClicked() {
         if (!HealthConnectReader.isAvailable(this)) {
@@ -119,7 +181,7 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch {
             if (reader.hasAllPermissions()) {
-                syncState.lastSyncCursor = null
+                syncState.resetAllHealthConnectCursors()
                 binding.textStatus.text = getString(R.string.status_resyncing_history)
                 triggerSync()
             } else {
@@ -138,7 +200,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshUi() {
-        binding.textOwner.text = getString(R.string.label_owner, syncState.owner?.label ?: "?")
+        binding.textOwner.text = getString(R.string.label_owner, syncState.owner ?: "?")
 
         val lastSync = syncState.lastSyncTimestamp
         binding.textLastSync.text = if (lastSync != null) {
@@ -147,7 +209,10 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.label_last_sync_never)
         }
 
-        val dataThrough = syncState.lastSyncCursor
+        // The most conservative reading across every Health Connect record type's own cursor --
+        // see SyncState.minHealthConnectCursor's doc for why there's no single shared cursor to
+        // read this off directly anymore.
+        val dataThrough = syncState.minHealthConnectCursor()
         binding.textDataThrough.text = if (dataThrough != null) {
             getString(R.string.label_data_through, dataThrough.toDisplayString())
         } else {
@@ -161,5 +226,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.buttonImportKey.visibility = if (driveUploader.hasServiceAccountKey()) View.GONE else View.VISIBLE
+        binding.buttonConnectExportFolder.visibility =
+            if (syncState.samsungHealthExportFolderUri != null) View.GONE else View.VISIBLE
+
+        // Persistent per-source problem list -- see the layout comment on text_source_warnings
+        // for why this is separate from textStatus above. Sorted by source name purely so the
+        // list doesn't reorder itself between refreshes for no reason.
+        val sourceErrors = syncState.allSourceErrors()
+        if (sourceErrors.isEmpty()) {
+            binding.textSourceWarnings.visibility = View.GONE
+        } else {
+            binding.textSourceWarnings.visibility = View.VISIBLE
+            binding.textSourceWarnings.text = getString(R.string.label_source_warnings_header) + "\n\n" +
+                sourceErrors.entries.sortedBy { it.key }.joinToString("\n\n") { (source, message) -> "⚠ $source\n$message" }
+        }
     }
 }

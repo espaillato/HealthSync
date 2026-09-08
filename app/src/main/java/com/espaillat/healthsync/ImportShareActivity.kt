@@ -138,7 +138,7 @@ class ImportShareActivity : AppCompatActivity() {
                     val parsed = SamsungHealthMonitorPdfImporter.parse(text)
                     val owner = syncState.owner
                     val rows = if (owner != null) {
-                        SamsungHealthMonitorPdfImporter.toCsvRows(parsed.readings, owner.label)
+                        SamsungHealthMonitorPdfImporter.toCsvRows(parsed.readings, owner)
                     } else {
                         emptyList()
                     }

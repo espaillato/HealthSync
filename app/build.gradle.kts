@@ -24,8 +24,8 @@ android {
         applicationId = "com.espaillat.healthsync"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 21
+        versionName = "1.20"
     }
 
     signingConfigs {
@@ -89,6 +89,12 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.2.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
     implementation("androidx.activity:activity-ktx:1.13.0")
+
+    // SAF folder access for the Samsung Health full-export import (HRV, respiratory rate) --
+    // the export lands in a fixed Downloads subfolder rather than being shared to a specific
+    // app, so this needs a user-granted folder tree (ACTION_OPEN_DOCUMENT_TREE), not a share
+    // target. DocumentFile wraps that as a filesystem-like API.
+    implementation("androidx.documentfile:documentfile:1.1.0")
 
     // Health Connect
     implementation("androidx.health.connect:connect-client:1.1.0")

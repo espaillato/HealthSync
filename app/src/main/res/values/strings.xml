@@ -2,8 +2,9 @@
     <string name="app_name">HealthSync</string>
 
     <string name="owner_picker_title">Whose phone is this?</string>
-    <string name="owner_ozzy">Ozzy</string>
-    <string name="owner_max">Max</string>
+    <string name="owner_name_hint">Your name</string>
+    <string name="button_confirm_owner">Continue</string>
+    <string name="error_owner_name_blank">Enter a name to continue</string>
 
     <string name="button_sync_now">Sync Now</string>
     <string name="button_import_key">Import Drive Key</string>
@@ -30,6 +31,9 @@
     <string name="status_import_no_file">No file attached to this share.</string>
     <string name="status_import_parsing">Parsing PDF…</string>
     <string name="status_import_parse_failed">Couldn\'t parse the PDF: %1$s</string>
+
+    <string name="button_connect_export_folder">Connect Samsung Health Export Folder</string>
+    <string name="label_source_warnings_header">Needs attention (stays until fixed):</string>
 
     <string name="widget_label">HealthSync</string>
     <string name="widget_subtitle">Tap to open</string>
