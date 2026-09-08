@@ -309,6 +309,16 @@ duplicate, since nothing outside that window was ever in the file to begin with.
 - Reinstalling and re-syncing doesn't duplicate old rows — see "Reinstalling, or switching to a
   differently-signed build" above for how that's guaranteed even with the cursor gone.
 
+## Related
+
+- [DriveOrganizerStarterKit](https://github.com/espaillato/DriveOrganizerStarterKit) — turns a
+  Google Drive archive into something an AI assistant can actually reason over and keep
+  current, not just search. The `Wearable_Data` CSVs this app produces are exactly the kind of
+  living, structured archive that kit is built to organize and query — the two are meant to be
+  used together, not overlapping tools.
+- [unwiredsolutions.com](https://www.unwiredsolutions.com/) — write-ups on this project and
+  related ones.
+
 ## License
 
 [MIT](LICENSE).
