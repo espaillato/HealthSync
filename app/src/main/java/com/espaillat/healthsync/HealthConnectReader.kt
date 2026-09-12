@@ -239,7 +239,6 @@ class HealthConnectReader(private val context: Context) {
         rows += readStatsDaily(until, owner, BodyTemperatureRecord::class, "body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
         rows += readStatsDaily(until, owner, BasalBodyTemperatureRecord::class, "basal_body_temperature", "celsius", time = { it.time }) { it.temperature.inCelsius }
         rows += readStatsDaily(until, owner, BloodGlucoseRecord::class, "blood_glucose", "mg_per_dL", time = { it.time }) { it.level.inMilligramsPerDeciliter }
-        rows += readStatsDaily(until, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
 
         // Body measurements -- point-in-time, not aggregated. Not from the Samsung watch (its
         // BIA sensor doesn't pass through Health Connect at all, per the design doc), but a
@@ -260,6 +259,16 @@ class HealthConnectReader(private val context: Context) {
         rows += readScalarInstant(until, owner, BoneMassRecord::class, "bone_mass", "kg", time = { it.time }) { it.mass.inKilograms }
         rows += readScalarInstant(until, owner, LeanBodyMassRecord::class, "lean_body_mass", "kg", time = { it.time }) { it.mass.inKilograms }
         rows += readScalarInstant(until, owner, BasalMetabolicRateRecord::class, "basal_metabolic_rate", "kcal_per_day", time = { it.time }) { it.basalMetabolicRate.inKilocaloriesPerDay }
+
+        // VO2max belongs here too, not with the fluctuating vitals above -- originally grouped
+        // with heart rate/HRV/etc. on the assumption it'd need the same daily min/avg/max
+        // treatment, but real data showed every single day ever recorded has exactly one
+        // Vo2MaxRecord, never more. That's because the watch only computes it as a byproduct of
+        // a qualifying outdoor walk/run exercise session (roughly 30+ min), not on a periodic
+        // schedule independent of exercise -- one estimate per matching session, same
+        // point-in-time nature as the exercise session itself. Splitting one reading into three
+        // identical rows was pure noise, not noise reduction.
+        rows += readScalarInstant(until, owner, Vo2MaxRecord::class, "vo2_max", "mL_per_kg_min", time = { it.time }) { it.vo2MillilitersPerMinuteKilogram }
 
         // Dense sample-based interval records -- same daily min/avg/max treatment as heart
         // rate, for the same reason: continuous sampling during workouts would otherwise be by

@@ -181,17 +181,16 @@ class DriveUploader(private val context: Context) {
     /**
      * [LEGACY_UNSUFFIXED_YEAR] *and everything before it* keeps the original, un-suffixed name --
      * not just rows from exactly that year. Real bug hit in practice: a Samsung full-export
-     * backfill can include history from well before rotation was introduced (confirmed on Max's
-     * account specifically -- pre-2026 history from before her current watch), and there's no
-     * pre-created file for any of those older years, nor should there be one per past year --
-     * unlike 2027 onward, past years aren't something to plan file names for ahead of time. Every
-     * year *after* [LEGACY_UNSUFFIXED_YEAR] gets its own explicit "_<year>" file instead, since
-     * those are genuinely new, growing years going forward.
-     */
-    /**
-     * Sanitized to filesystem/Drive-safe characters since [owner] is now free text (see
-     * SyncState.owner) rather than a fixed enum -- otherwise a name with e.g. a slash in it
-     * would silently create a subpath instead of a literal filename.
+     * backfill can include history from well before rotation was introduced (confirmed live --
+     * a watch's pre-2026 history from before its current device came through in one backfill),
+     * and there's no pre-created file for any of those older years, nor should there be one per
+     * past year -- unlike 2027 onward, past years aren't something to plan file names for ahead
+     * of time. Every year *after* [LEGACY_UNSUFFIXED_YEAR] gets its own explicit "_<year>" file
+     * instead, since those are genuinely new, growing years going forward.
+     *
+     * Also sanitized to filesystem/Drive-safe characters, since [owner] is free text (see
+     * SyncState.owner) rather than a fixed set of choices -- otherwise a name with e.g. a slash
+     * in it would silently create a subpath instead of a literal filename.
      */
     private fun fileNameForYear(owner: String, year: Int): String {
         val safeOwner = owner.trim().replace(Regex("[^A-Za-z0-9_ -]+"), "_")

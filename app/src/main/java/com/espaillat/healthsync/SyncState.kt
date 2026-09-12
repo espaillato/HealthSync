@@ -33,8 +33,8 @@ class SyncState(context: Context) {
      * nothing else could advance it, or got silently dragged far forward by *other* record types
      * succeeding, which on a first-ever sync or a "Resync Full History" tap (a much wider query
      * window than one day) risked skipping weeks of that one metric's history in a single jump.
-     * Real, confirmed-live case that motivated this: `StepsRecord` on Max's account hit this bug
-     * twice, each time stalling for about 5 days before the shared cursor happened to drag far
+     * Real, confirmed-live case that motivated this: `StepsRecord` hit this bug twice on one
+     * account, each time stalling for about 5 days before the shared cursor happened to drag far
      * enough past the bad record for Steps to work again on its own.
      *
      * Only advances on success -- see [HealthConnectReader.readAllPages] for the forced-forward
@@ -72,6 +72,25 @@ class SyncState(context: Context) {
         val editor = prefs.edit()
         prefs.all.keys.filter { it.startsWith(KEY_HC_CURSOR_PREFIX) }.forEach { editor.remove(it) }
         editor.apply()
+    }
+
+    /**
+     * One-time migration: `vo2_max` moved from a daily min/avg/max aggregate to point-in-time
+     * (see [HealthConnectReader]'s `Vo2MaxRecord` read) -- real data showed it's never more than
+     * one reading a day, so the three-row split was pure noise. An install that already synced
+     * under the old scheme has its `Vo2MaxRecord` cursor advanced past all currently-retained
+     * history, which would otherwise mean the new point-in-time rows never get backfilled. This
+     * resets just that one record type's cursor, once, so the next sync re-reads Health
+     * Connect's full VO2max history and emits it under the new format -- cheap, since real data
+     * shows this is only ever a handful of readings total. Safe to call every sync: the flag
+     * guarantees it only actually resets the cursor once per install.
+     */
+    fun migrateVo2MaxCursorIfNeeded() {
+        if (prefs.getBoolean(KEY_VO2MAX_MIGRATED, false)) return
+        prefs.edit()
+            .remove(KEY_HC_CURSOR_PREFIX + "Vo2MaxRecord")
+            .putBoolean(KEY_VO2MAX_MIGRATED, true)
+            .apply()
     }
 
     /** Timestamp of the most recent sync attempt, success or failure. */
@@ -185,5 +204,6 @@ class SyncState(context: Context) {
         private const val KEY_EXPORT_FOLDER_URI = "samsung_health_export_folder_uri"
         private const val KEY_EXPORT_CURSOR_PREFIX = "samsung_health_export_cursor_epoch_ms_"
         private const val KEY_SOURCE_ERROR_PREFIX = "source_error_"
+        private const val KEY_VO2MAX_MIGRATED = "vo2max_point_in_time_migrated"
     }
 }

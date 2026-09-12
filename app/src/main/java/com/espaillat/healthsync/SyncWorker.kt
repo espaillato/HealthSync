@@ -29,6 +29,8 @@ class SyncWorker(appContext: Context, params: WorkerParameters) : CoroutineWorke
         val owner = syncState.owner
             ?: return recordFailure(syncState, "No owner selected yet")
 
+        syncState.migrateVo2MaxCursorIfNeeded()
+
         if (!HealthConnectReader.isAvailable(applicationContext)) {
             return recordFailure(syncState, "Health Connect is not available on this device")
         }

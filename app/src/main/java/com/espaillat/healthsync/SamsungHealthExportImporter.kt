@@ -328,7 +328,12 @@ object SamsungHealthExportImporter {
         var maxInstant: Instant? = null
         for (row in dataRows) {
             val startRaw = row.valueOf(header, "start_time") ?: continue
-            val avg = row.valueOf(header, "average")?.toDoubleOrNull() ?: continue
+            // Real export data has surfaced a stray 0.0 reading here and there -- physiologically
+            // impossible (nobody has a respiratory rate of zero breaths/min while this export
+            // exists to report on them) and clearly a bad sensor sample slipping through
+            // unfiltered on Samsung's side, not a genuine measurement. Dropped rather than kept,
+            // so it can't drag a day's min down to a nonsense value.
+            val avg = row.valueOf(header, "average")?.toDoubleOrNull()?.takeIf { it > 0.0 } ?: continue
             val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "time_offset")) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = instant.atZone(ZoneId.systemDefault()).toLocalDate()
@@ -742,9 +747,9 @@ object SamsungHealthExportImporter {
      * per-bucket summary is exactly what's needed here. Bucketed to a sleep day (see
      * [sleepDayOf]) rather than daily min/avg/max like the other dense metrics, per the
      * functional-medicine reasoning behind this request: skin temperature is overwhelmingly a
-     * *sleep* signal (illness-onset fever, or for Max specifically a vasomotor/hot-flash proxy
-     * during the menopause transition), and a night's readings routinely straddle midnight, so
-     * calendar-day bucketing would split one night's data across two dates.
+     * *sleep* signal (illness-onset fever, or a vasomotor/hot-flash proxy), and a night's
+     * readings routinely straddle midnight, so calendar-day bucketing would split one night's
+     * data across two dates.
      *
      * `baseline`/`lower_bound`/`upper_bound` are populated in the large majority of rows
      * (confirmed: ~90% in a real sample) but not universally, so `skin_temp_baseline_deviation`

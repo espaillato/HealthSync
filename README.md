@@ -191,12 +191,15 @@ midnight.
 
 **Aggregated to daily min/avg/max, three rows per local day** (fluctuating readings — heart
 rate, resting heart rate, HRV, oxygen saturation, respiratory rate, body/basal temperature,
-blood glucose, VO2 max, speed, power, cycling cadence, steps cadence).
+blood glucose, speed, power, cycling cadence, steps cadence).
 
 **Not aggregated — one row per record, point-in-time** (weight, height, body fat %, bone mass,
-lean body mass, basal metabolic rate, **blood pressure**, **exercise sessions**) — a scale
-reading, a blood pressure check, or a single workout, is a deliberate discrete event, not a
-rate to smooth over a day. Exercise sessions carry the session's real Health Connect record ID,
+lean body mass, basal metabolic rate, **VO2max**, **blood pressure**, **exercise sessions**) —
+a scale reading, a blood pressure check, or a single workout, is a deliberate discrete event,
+not a rate to smooth over a day. VO2max belongs here rather than with the fluctuating vitals
+above: it's computed as a byproduct of a single qualifying exercise session (a long enough
+outdoor walk/run), not on a schedule independent of exercise, so it's never more than one
+reading for the same session. Exercise sessions carry the session's real Health Connect record ID,
 title/notes (when present), and the min/avg/max heart rate recorded during that session's time
 window, cross-referenced from the heart-rate stream separately.
 
