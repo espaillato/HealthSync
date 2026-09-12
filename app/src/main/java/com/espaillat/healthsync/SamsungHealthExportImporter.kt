@@ -74,6 +74,13 @@ object SamsungHealthExportImporter {
     private const val METRIC_MEAN_ARTERIAL_PRESSURE = "mean_arterial_pressure"
     private const val METRIC_EXERCISE_TITLE = "exercise_title"
 
+    // A sanity floor, not a real product date -- long before any Samsung wearable with these
+    // features existed, so an export row that parses to before this is a garbage/placeholder
+    // timestamp in the raw data, not a real reading. Found in practice: an old full-history
+    // backup surfaced two snoring rows whose start_time parsed to right around the Unix epoch,
+    // bucketing them into a nonsense "1969-12-31" sleep day.
+    private val EARLIEST_PLAUSIBLE_SAMSUNG_DATA: Instant = Instant.parse("2015-01-01T00:00:00Z")
+
     private data class ParsedPart(val rows: List<CsvRow>, val maxInstant: Instant?)
 
     /**
@@ -590,7 +597,7 @@ object SamsungHealthExportImporter {
             // value was shifting every exercise_title row 9 hours *too early* -- confirmed
             // against 39 independent session pairs, not a one-off. Parsed directly as UTC here
             // instead, with nothing to convert.
-            val instant = runCatching { LocalDateTime.parse(startRaw, LOCAL_DATETIME_FORMAT).toInstant(ZoneOffset.UTC) }.getOrNull() ?: continue
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = instant.atZone(ZoneId.systemDefault()).toLocalDate()
             if (!day.isBefore(today)) continue
@@ -633,7 +640,7 @@ object SamsungHealthExportImporter {
             // subsystem and evidently share the same raw-UTC convention, despite also carrying a
             // time_offset field that looks exactly like the naive-local-plus-offset convention
             // every other Samsung export type actually uses.
-            val instant = runCatching { LocalDateTime.parse(startRaw, LOCAL_DATETIME_FORMAT).toInstant(ZoneOffset.UTC) }.getOrNull() ?: continue
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = instant.atZone(ZoneId.systemDefault()).toLocalDate()
             if (!day.isBefore(today)) continue
@@ -952,13 +959,33 @@ object SamsungHealthExportImporter {
     // all, this falls back to the device's current zone rather than UTC -- a naive local
     // timestamp with no zone information was never actually a UTC timestamp to begin with, and
     // assuming UTC would shift the effective calendar day for anyone not near that meridian.
+    /**
+     * Returns null (same as any other unparseable value -- every call site already handles that
+     * with `?: continue`) for a result before [EARLIEST_PLAUSIBLE_SAMSUNG_DATA], not just for a
+     * string that fails to parse outright. Applied here rather than at each of this function's
+     * many call sites, so every metric that reads a `start_time` this way is covered by
+     * construction, not by remembering to add the same guard everywhere -- found in practice via
+     * one call site (snoring) surfacing a garbage near-epoch timestamp from an old full-history
+     * backup; there was no reason to assume the other Samsung export types couldn't carry the
+     * same kind of bad row, so this isn't scoped to just the one observed so far.
+     */
     private fun parseLocalDateTimeWithOffset(raw: String, offsetRaw: String?): Instant? {
         val localDateTime = runCatching { LocalDateTime.parse(raw, LOCAL_DATETIME_FORMAT) }.getOrNull() ?: return null
         val offset = offsetRaw?.let { UTC_OFFSET_PATTERN.find(it) }
             ?.let { m -> runCatching { ZoneOffset.of("${m.groupValues[1]}:${m.groupValues[2]}") }.getOrNull() }
             ?: ZoneId.systemDefault().rules.getOffset(localDateTime)
-        return localDateTime.toInstant(offset)
+        return localDateTime.toInstant(offset).takeIf { !it.isBefore(EARLIEST_PLAUSIBLE_SAMSUNG_DATA) }
     }
+
+    /**
+     * For the handful of Samsung export fields confirmed already-UTC despite carrying a
+     * `time_offset` field (see the exercise start/end-time and recovery-heart-rate parsers) --
+     * parses directly, with no offset to apply, same [EARLIEST_PLAUSIBLE_SAMSUNG_DATA] floor as
+     * [parseLocalDateTimeWithOffset] for the same reason.
+     */
+    private fun parseLocalDateTimeAsUtc(raw: String): Instant? =
+        runCatching { LocalDateTime.parse(raw, LOCAL_DATETIME_FORMAT).toInstant(ZoneOffset.UTC) }.getOrNull()
+            ?.takeIf { !it.isBefore(EARLIEST_PLAUSIBLE_SAMSUNG_DATA) }
 
     // Matches HealthConnectReader's own daily-aggregate shape and ID scheme exactly
     // (metric_daily_<date>#min/avg/max, local date encoded as UTC midnight) -- not duplicated
