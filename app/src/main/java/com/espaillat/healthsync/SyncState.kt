@@ -12,6 +12,10 @@ class SyncState(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    init {
+        migrateLegacyOwnerCaseIfNeeded()
+    }
+
     /**
      * Free text, not a fixed set of choices -- entered once on first launch (see
      * OwnerPickerActivity) and persisted forever after. Everything downstream (the Drive CSV
@@ -72,6 +76,37 @@ class SyncState(context: Context) {
         val editor = prefs.edit()
         prefs.all.keys.filter { it.startsWith(KEY_HC_CURSOR_PREFIX) }.forEach { editor.remove(it) }
         editor.apply()
+    }
+
+    /**
+     * One-time migration: [owner] used to be a fixed-choice picker backed by an enum, persisted
+     * as that enum constant's raw identifier (e.g. `"OZZY"`) rather than the human-friendly
+     * label it was always displayed as (`"Ozzy"`) -- every read of it went through the enum's
+     * separate label field, so the all-caps identifier itself never actually surfaced anywhere.
+     * Now that [owner] is free text with no enum to resolve it through, an install that already
+     * had a value stored under that old scheme would otherwise start surfacing the raw
+     * identifier verbatim -- in the CSV `owner` column, the Drive filename, the UI -- the first
+     * time this code runs.
+     *
+     * Detected generically (an existing value that's entirely uppercase) rather than checking
+     * for specific legacy names, since a fresh free-text install has no legacy value to collide
+     * with in the first place. Guarded further by requiring some prior sync history to already
+     * exist: a brand-new install that happens to type an all-caps name on its very first launch
+     * has no such history yet, so it's left exactly as entered rather than "corrected" against
+     * the user's actual choice.
+     */
+    private fun migrateLegacyOwnerCaseIfNeeded() {
+        if (prefs.getBoolean(KEY_LEGACY_OWNER_CASE_MIGRATED, false)) return
+        prefs.edit().putBoolean(KEY_LEGACY_OWNER_CASE_MIGRATED, true).apply()
+
+        val raw = prefs.getString(KEY_OWNER, null) ?: return
+        if (raw != raw.uppercase() || raw == raw.lowercase()) return
+        val hasPriorSyncHistory = prefs.all.keys.any {
+            it.startsWith(KEY_HC_CURSOR_PREFIX) || it.startsWith(KEY_EXPORT_CURSOR_PREFIX)
+        }
+        if (!hasPriorSyncHistory) return
+
+        prefs.edit().putString(KEY_OWNER, raw.lowercase().replaceFirstChar { it.uppercase() }).apply()
     }
 
     /**
@@ -205,5 +240,6 @@ class SyncState(context: Context) {
         private const val KEY_EXPORT_CURSOR_PREFIX = "samsung_health_export_cursor_epoch_ms_"
         private const val KEY_SOURCE_ERROR_PREFIX = "source_error_"
         private const val KEY_VO2MAX_MIGRATED = "vo2max_point_in_time_migrated"
+        private const val KEY_LEGACY_OWNER_CASE_MIGRATED = "legacy_owner_case_migrated"
     }
 }
