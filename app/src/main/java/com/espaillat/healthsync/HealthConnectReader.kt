@@ -224,11 +224,21 @@ class HealthConnectReader(private val context: Context) {
      */
     private val pendingCursors = mutableMapOf<String, Instant>()
 
+    /** Record types read from the very beginning this sync, and whether sleep rows may replace
+     *  existing ones regardless of age -- both set only during the one-time sleep re-bucketing. */
+    private val fullHistorySources = mutableSetOf<String>()
+    private var sleepRebucketPending = false
+
     /** Persists every cursor move [readSince] queued. Call only after the rows it returned have
      *  been uploaded successfully (or there was nothing to upload). */
     fun commitCursors() {
         pendingCursors.forEach { (recordType, cursor) -> syncState.setHealthConnectCursor(recordType, cursor) }
         pendingCursors.clear()
+        if (sleepRebucketPending) {
+            syncState.markSleepStartBucketingApplied()
+            sleepRebucketPending = false
+            fullHistorySources.clear()
+        }
     }
 
     suspend fun hasAllPermissions(): Boolean =
@@ -264,6 +274,14 @@ class HealthConnectReader(private val context: Context) {
      */
     suspend fun readSince(until: Instant, owner: String): List<CsvRow> {
         val rows = mutableListOf<CsvRow>()
+
+        // One-time: sleep rows were first written with each session bucketed by its END time (see
+        // [sessionDayOf]). Re-read the whole retained sleep and heart-rate history once and let the
+        // sleep rows replace what's on Drive whatever their age; only marked done by
+        // [commitCursors], i.e. after the upload succeeded, so a failed attempt simply repeats.
+        sleepRebucketPending = !syncState.sleepStartBucketingApplied
+        fullHistorySources.clear()
+        if (sleepRebucketPending) fullHistorySources += setOf("SleepSessionRecord", "HeartRateRecord")
 
         // Fetched once, reused below by more than one metric -- SleepSessionRecord by both
         // readSleep and readSleepHeartRate, ExerciseSessionRecord by readExercise alone but kept
@@ -343,8 +361,12 @@ class HealthConnectReader(private val context: Context) {
         return rows.map { markReplaceableIfRecent(it) }
     }
 
+    private fun isSleepDerivedDaily(id: String): Boolean =
+        id.startsWith("sleep_session_duration_daily_") || id.startsWith("sleep_stage_") || id.startsWith("sleep_heart_rate_daily_")
+
     private fun markReplaceableIfRecent(row: CsvRow): CsvRow {
         if (!row.sourceRecordId.contains("_daily_")) return row
+        if (sleepRebucketPending && isSleepDerivedDaily(row.sourceRecordId)) return row.copy(replaceExisting = true)
         val day = row.timestampUtc.atZone(ZoneOffset.UTC).toLocalDate()
         val oldestReplaceable = LocalDate.now(ZoneId.systemDefault()).minusDays(TRAILING_DAYS)
         return if (!day.isBefore(oldestReplaceable)) row.copy(replaceExisting = true) else row
@@ -359,7 +381,7 @@ class HealthConnectReader(private val context: Context) {
      */
     private suspend fun <T : Record> readAllPages(recordType: KClass<T>, until: Instant, timestampOf: (T) -> Instant): List<T> {
         val sourceKey = recordType.simpleName ?: "UnknownRecordType"
-        val cursor = syncState.healthConnectCursor(sourceKey)
+        val cursor = if (sourceKey in fullHistorySources) null else syncState.healthConnectCursor(sourceKey)
         // Re-reads the last TRAILING_DAYS behind the cursor on every sync, not just what's new:
         // a day's records can land in Health Connect *after* the sync that first passed that day
         // (the watch data isn't pushed into Health Connect until Samsung Health next runs -- seen
@@ -567,8 +589,16 @@ class HealthConnectReader(private val context: Context) {
      * sleep" regardless of exact bedtime. Nobody is asleep at noon under a normal schedule, so
      * that's a safe place to draw the line.
      */
-    private fun sleepDayOf(instant: Instant): LocalDate =
-        instant.atZone(ZoneId.systemDefault()).minusHours(12).toLocalDate()
+    private fun sleepDayOf(instant: Instant): LocalDate = sleepDayOf(instant, ZoneId.systemDefault())
+
+    /**
+     * The sleep day a whole session belongs to: the noon-to-noon day its *start* falls in, not its
+     * end. A session that begins at 3:30 AM and runs to 1:19 PM is "last night's sleep" -- by end
+     * time it would land in the following day and merge with the next night (seen live: 18-hour
+     * "days", and a day with no sleep at all), which is what happens to anyone who sleeps past noon.
+     * Start-based also matches how the Samsung export's Sleep Score rows are bucketed.
+     */
+    private fun sessionDayOf(session: SleepSessionRecord): LocalDate = sleepDayOf(session.startTime)
 
     /**
      * A daily bucket's date, carried internally as UTC midnight of that same date -- deliberately
@@ -612,18 +642,20 @@ class HealthConnectReader(private val context: Context) {
     private fun readSleep(sessions: List<SleepSessionRecord>, owner: String): List<CsvRow> {
         val rows = mutableListOf<CsvRow>()
 
-        sessions.groupBy { sleepDayOf(it.endTime) }
+        sleepMinutesByDay(sessions.map { it.startTime to it.endTime }, ZoneId.systemDefault())
             .filterKeys { isCompleteSleepDay(it) }
-            .forEach { (day, daySessions) ->
-                val totalMinutes = daySessions.sumOf { Duration.between(it.startTime, it.endTime).toMinutes() }
+            .forEach { (day, totalMinutes) ->
                 rows += CsvRow(day.asTimestamp(), owner, "sleep_session_duration", totalMinutes.toString(), "minutes", "sleep_session_duration_daily_$day")
             }
 
         val stageMinutesByDayAndType = mutableMapOf<Pair<LocalDate, String>, Long>()
         for (session in sessions) {
+            // A session's stages all belong to the session's own day. Bucketing each stage by its
+            // own end time split a session that crosses noon across two days, so its stage minutes
+            // stopped adding up to its duration.
+            val day = sessionDayOf(session)
+            if (!isCompleteSleepDay(day)) continue
             for (stage in session.stages) {
-                val day = sleepDayOf(stage.endTime)
-                if (!isCompleteSleepDay(day)) continue
                 val key = day to stageTypeName(stage.stage)
                 val minutes = Duration.between(stage.startTime, stage.endTime).toMinutes()
                 stageMinutesByDayAndType.merge(key, minutes, Long::plus)
@@ -661,7 +693,7 @@ class HealthConnectReader(private val context: Context) {
 
         val byDay = mutableMapOf<LocalDate, MutableList<Double>>()
         for (session in sessions) {
-            val day = sleepDayOf(session.endTime)
+            val day = sessionDayOf(session)
             if (!isCompleteSleepDay(day)) continue
             val inSession = hrSamples.filter { it.first >= session.startTime && it.first <= session.endTime }
             if (inSession.isEmpty()) continue
@@ -802,3 +834,14 @@ class HealthConnectReader(private val context: Context) {
             HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE
     }
 }
+
+/** The noon-to-noon "sleep day" [instant] falls in, for the given zone. Internal so it can be tested. */
+internal fun sleepDayOf(instant: Instant, zone: ZoneId): LocalDate = instant.atZone(zone).minusHours(12).toLocalDate()
+
+/**
+ * Minutes of sleep per sleep day, each session counted once under the day its *start* falls in.
+ * Internal so it can be tested against real session times.
+ */
+internal fun sleepMinutesByDay(sessions: List<Pair<Instant, Instant>>, zone: ZoneId): Map<LocalDate, Long> =
+    sessions.groupBy({ sleepDayOf(it.first, zone) }, { Duration.between(it.first, it.second).toMinutes() })
+        .mapValues { (_, minutes) -> minutes.sum() }

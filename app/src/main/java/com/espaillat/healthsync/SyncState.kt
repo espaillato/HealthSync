@@ -95,6 +95,13 @@ class SyncState(context: Context) {
         prefs.edit().putStringSet(KEY_PROCESSED_EXPORTS, processedExportFolders() - name).apply()
     }
 
+    /** Whether the one-time re-bucketing of sleep rows by session *start* day has completed. */
+    val sleepStartBucketingApplied: Boolean get() = prefs.getBoolean(KEY_SLEEP_START_BUCKETING, false)
+
+    fun markSleepStartBucketingApplied() {
+        prefs.edit().putBoolean(KEY_SLEEP_START_BUCKETING, true).apply()
+    }
+
     /**
      * One-time migration: [owner] used to be a fixed-choice picker backed by an enum, persisted
      * as that enum constant's raw identifier (e.g. `"ALEX"`) rather than the human-friendly
@@ -259,5 +266,6 @@ class SyncState(context: Context) {
         private const val KEY_VO2MAX_MIGRATED = "vo2max_point_in_time_migrated"
         private const val KEY_LEGACY_OWNER_CASE_MIGRATED = "legacy_owner_case_migrated"
         private const val KEY_PROCESSED_EXPORTS = "processed_export_folders"
+        private const val KEY_SLEEP_START_BUCKETING = "sleep_start_bucketing_applied"
     }
 }
