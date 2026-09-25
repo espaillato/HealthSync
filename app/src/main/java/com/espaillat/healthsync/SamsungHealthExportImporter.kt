@@ -948,7 +948,11 @@ object SamsungHealthExportImporter {
         var maxInstant: Instant? = null
         for (row in dataRows) {
             val startRaw = row.valueOf(header, "com.samsung.health.sleep.start_time") ?: continue
-            val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "com.samsung.health.sleep.time_offset")) ?: continue
+            // `start_time` here is already a UTC instant, despite the `time_offset` beside it -- the
+            // same quirk the exercise and blood-pressure fields have. Found via a downstream check:
+            // read as local time plus offset, session starts piled up between 1 and 7 PM (as stored),
+            // while shifted by the offset they cluster at 11 PM - 2 AM, i.e. real bedtimes.
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = sleepDayOf(instant)
             if (!isCompleteSleepDay(day)) continue
