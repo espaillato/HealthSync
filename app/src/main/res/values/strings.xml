@@ -1,0 +1,42 @@
+<resources>
+    <string name="app_name">HealthSync</string>
+
+    <string name="owner_picker_title">Whose phone is this?</string>
+    <string name="owner_name_hint">Your name</string>
+    <string name="button_confirm_owner">Continue</string>
+    <string name="error_owner_name_blank">Enter a name to continue</string>
+
+    <string name="button_sync_now">Sync Now</string>
+    <string name="button_import_key">Import Drive Key</string>
+    <string name="button_resync_history">Resync Full History</string>
+    <string name="status_key_import_failed">Couldn\'t import key: %1$s</string>
+    <string name="status_resyncing_history">Resyncing full history…</string>
+    <string name="label_owner">Owner: %1$s</string>
+    <string name="label_last_sync">Last sync attempt: %1$s</string>
+    <string name="label_last_sync_never">Last sync attempt: never</string>
+    <string name="label_data_through">Data through: %1$s</string>
+    <string name="label_data_through_none">Data through: nothing synced yet</string>
+
+    <string name="status_never_synced">Not synced yet</string>
+    <string name="status_success">Last sync succeeded</string>
+    <string name="status_error">Last sync failed: %1$s</string>
+    <string name="status_syncing">Syncing…</string>
+    <string name="status_permissions_needed">Health Connect permissions needed — tap Sync Now</string>
+    <string name="status_health_connect_unavailable">Health Connect isn\'t available on this device</string>
+
+    <string name="import_share_label">Import to HealthSync</string>
+    <string name="button_done">Done</string>
+    <string name="button_add_to_sync">Add to Sync</string>
+    <string name="status_import_not_a_pdf_share">This screen only handles a PDF shared via \"Import to HealthSync\" -- nothing to do here otherwise.</string>
+    <string name="status_import_no_file">No file attached to this share.</string>
+    <string name="status_import_parsing">Parsing PDF…</string>
+    <string name="status_import_parse_failed">Couldn\'t parse the PDF: %1$s</string>
+
+    <string name="button_connect_export_folder">Connect Samsung Health Export Folder</string>
+    <string name="label_source_warnings_header">Needs attention (stays until fixed):</string>
+
+    <string name="widget_label">HealthSync</string>
+    <string name="widget_subtitle">Tap to open</string>
+    <string name="widget_last_sync">Synced %1$s</string>
+    <string name="widget_error">Last sync failed — tap to open</string>
+</resources>
