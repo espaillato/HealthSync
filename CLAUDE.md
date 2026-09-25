@@ -118,6 +118,10 @@ If you're asked to change something rather than just install it fresh:
   by eye: every original ID still present, no duplicate IDs, and only the rows you expected changed.
   Health data can't be regenerated, and several bugs here only showed up as a discrepancy between
   two sources. Don't edit the CSVs while a phone might be syncing.
+- **Verify time zones from the data, not the column names.** Samsung export `start_time` values are
+  almost always UTC despite an adjacent `time_offset`; the reliable check is the hour-of-day
+  histogram of the raw clock (see the README's note on the export importer). Several bugs here were
+  the same nine-hour error found one metric at a time.
 - **Samsung exports are one-shot.** The app parses a `samsunghealth_*` folder in Downloads and then
   deletes it. Don't tap Sync (and don't let a nightly run) on a phone that has an export
   half-downloaded or that is still on an old build — copy the top-level CSVs off with `adb pull`

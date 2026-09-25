@@ -278,6 +278,14 @@ the export periodically (it's a full re-dump of your entire history every time, 
 incremental) just gets picked up and deduplicated automatically via a per-metric cursor, same
 as everything else in this app.
 
+**A trap for anyone extending the importer:** in the export, nearly every `start_time` is a **UTC
+instant** even though a `time_offset` column sits right beside it and looks like "local time plus
+offset" (mean arterial pressure is the exception). Reading it as local time puts every reading nine
+hours off (in a +9 zone) and quietly mis-buckets daily rows. To check a new type, don't compare
+against `create_time` (same clock); look at the hour-of-day histogram of the raw `start_time`
+instead and see whether it peaks when the activity really happens *after* shifting by the offset —
+awake metrics should peak in the daytime, sleep metrics overnight.
+
 Once an export is parsed and its rows are saved, the app deletes the whole export folder — it's raw
 personal health data. That delete is a single call, but the system does per-file work inside it, so
 on a large export it can take many minutes; the app runs it as its own resumable background task
