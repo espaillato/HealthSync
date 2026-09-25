@@ -95,6 +95,13 @@ class SyncState(context: Context) {
         prefs.edit().putStringSet(KEY_PROCESSED_EXPORTS, processedExportFolders() - name).apply()
     }
 
+    /** Whether the one-time re-derivation of export metrics timestamped on the wrong clock is done. */
+    val exportUtcRederiveApplied: Boolean get() = prefs.getBoolean(KEY_EXPORT_UTC_REDERIVE, false)
+
+    fun markExportUtcRederiveApplied() {
+        prefs.edit().putBoolean(KEY_EXPORT_UTC_REDERIVE, true).apply()
+    }
+
     /** Whether the one-time re-bucketing of sleep rows by session *start* day has completed. */
     val sleepStartBucketingApplied: Boolean get() = prefs.getBoolean(KEY_SLEEP_START_BUCKETING, false)
 
@@ -267,5 +274,6 @@ class SyncState(context: Context) {
         private const val KEY_LEGACY_OWNER_CASE_MIGRATED = "legacy_owner_case_migrated"
         private const val KEY_PROCESSED_EXPORTS = "processed_export_folders"
         private const val KEY_SLEEP_START_BUCKETING = "sleep_start_bucketing_applied"
+        private const val KEY_EXPORT_UTC_REDERIVE = "export_utc_rederive_applied"
     }
 }

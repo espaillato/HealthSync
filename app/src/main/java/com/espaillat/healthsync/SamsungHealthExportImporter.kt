@@ -85,7 +85,24 @@ object SamsungHealthExportImporter {
 
     private data class ParsedPart(val rows: List<CsvRow>, val maxInstant: Instant?)
 
-    private data class ExportParse(val rows: List<CsvRow>, val anyFailure: Boolean, val cursors: Map<String, Instant>)
+    private data class ExportParse(
+        val rows: List<CsvRow>,
+        val anyFailure: Boolean,
+        val cursors: Map<String, Instant>,
+        /** Metric keys that were found and parsed without failing -- used to decide whether a
+         *  one-time re-derivation actually covered everything it needed to. */
+        val succeeded: Set<String> = emptySet(),
+    )
+
+    /**
+     * Metrics whose history was derived from timestamps read as local time when they are really UTC
+     * (see [parseLocalDateTimeAsUtc]), so already-synced daily rows were bucketed on a clock nine
+     * hours off -- and, for HRV, had whole nights skipped by the cursor check. Each export holds
+     * the full history, so the first export processed after this fix re-derives all of it: cursors
+     * are ignored for these metrics, and their daily rows are allowed to replace what's on Drive.
+     * Only marked done once every one of them parsed successfully.
+     */
+    private val REDERIVE_METRICS = setOf(METRIC_RESPIRATORY_RATE, METRIC_HRV, METRIC_STRESS, METRIC_SKIN_TEMP, METRIC_SNORE)
 
     /**
      * Scans the user-granted export folder (if one's been configured) for Samsung Health export
@@ -154,8 +171,9 @@ object SamsungHealthExportImporter {
             // the reason a full health-data export is left behind on disk.
             val parseStarted = System.currentTimeMillis()
             var parsed = ExportParse(emptyList(), true, emptyMap())
+            val rederive = !syncState.exportUtcRederiveApplied
             try {
-                parsed = parseExportFolder(context, exportFolder, owner, syncState)
+                parsed = parseExportFolder(context, exportFolder, owner, syncState, rederive)
             } catch (e: Exception) {
                 Log.e(TAG, "Unexpected failure processing Samsung Health export '$exportFolderName' -- cleaning it up anyway", e)
             }
@@ -165,6 +183,10 @@ object SamsungHealthExportImporter {
             // never saved.
             if (parsed.rows.isNotEmpty()) PendingImports.stage(context, parsed.rows)
             parsed.cursors.forEach { (metric, cursor) -> syncState.setSamsungHealthExportCursor(metric, cursor) }
+            if (rederive && parsed.succeeded.containsAll(REDERIVE_METRICS)) {
+                syncState.markExportUtcRederiveApplied()
+                Log.i(TAG, "Re-derived ${REDERIVE_METRICS.size} export metrics from '$exportFolderName' (one-time UTC/bucketing correction)")
+            }
             syncState.markExportProcessed(exportFolderName)
             cleanupNeeded = true
             Log.i(
@@ -289,9 +311,11 @@ object SamsungHealthExportImporter {
         exportFolder: DocumentFile,
         owner: String,
         syncState: SyncState,
+        rederive: Boolean,
     ): ExportParse {
         val rows = mutableListOf<CsvRow>()
         var anyFailure = false
+        val succeeded = mutableSetOf<String>()
         // Where each metric's cursor should move to -- returned to the caller rather than written
         // here, because a cursor must only move once the rows it covers have been saved. Writing it
         // immediately (as this used to) meant a job killed partway through the parse -- Android
@@ -302,14 +326,18 @@ object SamsungHealthExportImporter {
 
         fun run(metricKey: String, typeName: String, parse: (DocumentFile, Instant?) -> ParsedPart) {
             val file = findMetricFile(exportFolder, typeName) ?: return
-            val cursor = syncState.samsungHealthExportCursor(metricKey)
+            val reset = rederive && metricKey in REDERIVE_METRICS
+            val cursor = if (reset) null else syncState.samsungHealthExportCursor(metricKey)
             val part = tryParseMetric(syncState, metricKey) { parse(file, cursor) }
             if (part == null) {
                 anyFailure = true
                 return
             }
-            rows += part.rows
-            if (part.maxInstant != null && (cursor == null || part.maxInstant.isAfter(cursor))) {
+            succeeded += metricKey
+            // Re-derivation: the daily rows must be able to replace the mis-bucketed ones already
+            // on Drive (same IDs), instead of being dropped as duplicates.
+            rows += if (reset) part.rows.map { if (it.sourceRecordId.contains("_daily_")) it.copy(replaceExisting = true) else it } else part.rows
+            if (part.maxInstant != null && (reset || cursor == null || part.maxInstant.isAfter(cursor))) {
                 cursorUpdates[metricKey] = part.maxInstant
             }
         }
@@ -369,7 +397,7 @@ object SamsungHealthExportImporter {
             parseExerciseTitle(context, file, customExerciseFile, owner, cursor)
         }
 
-        return ExportParse(rows, anyFailure, cursorUpdates)
+        return ExportParse(rows, anyFailure, cursorUpdates, succeeded)
     }
 
     // Several metric types point at a separate per-record JSON file rather than carrying their
@@ -406,13 +434,19 @@ object SamsungHealthExportImporter {
             // unfiltered on Samsung's side, not a genuine measurement. Dropped rather than kept,
             // so it can't drag a day's min down to a nonsense value.
             val avg = row.valueOf(header, "average")?.toDoubleOrNull()?.takeIf { it > 0.0 } ?: continue
-            val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "time_offset")) ?: continue
+            // `start_time` is a UTC instant despite the `time_offset` beside it -- the same quirk as the
+            // exercise, blood-pressure and sleep fields. Confirmed from a raw export: for every type
+            // marked UTC the clock peaks exactly where real behaviour does once shifted by the
+            // offset (awake metrics 09:00-24:00 local, sleep-time ones 23:00-08:00). Reading it as
+            // local time put every reading nine hours early.
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
-            val day = instant.atZone(ZoneId.systemDefault()).toLocalDate()
-            // Same completeness reasoning as HealthConnectReader's isCompleteCalendarDay --
-            // today isn't over yet, so finalizing it now would mean a later export covering
-            // the rest of today gets silently deduped away instead of adding to it.
-            if (!day.isBefore(today)) continue
+            // A sleep-time measurement, so it belongs to the noon-to-noon sleep day like skin
+            // temperature and snoring -- a calendar day would split every night across midnight.
+            // Completeness follows the same reasoning as HealthConnectReader's isCompleteSleepDay:
+            // a sleep day still in progress would get finalized short and then never corrected.
+            val day = sleepDayOf(instant)
+            if (!isCompleteSleepDay(day)) continue
             byDay.getOrPut(day) { mutableListOf() }.add(avg)
             if (maxInstant == null || instant.isAfter(maxInstant)) maxInstant = instant
         }
@@ -440,7 +474,11 @@ object SamsungHealthExportImporter {
             // This is the actual point of the cursor: skipping a row means skipping the file
             // open entirely, not opening it and discarding the result.
             val bucketStartRaw = row.valueOf(header, "start_time")
-            val bucketInstant = bucketStartRaw?.let { parseLocalDateTimeWithOffset(it, row.valueOf(header, "time_offset")) }
+            // Same UTC quirk as everywhere else here. Read as local time this came out nine hours
+            // early, so the cursor check below skipped every bucket that *started* within nine hours
+            // after the last one processed -- silently dropping up to a night of HRV at each export.
+            // (The sub-readings inside the JSON carry true epoch times, so their day was always right.)
+            val bucketInstant = bucketStartRaw?.let { parseLocalDateTimeAsUtc(it) }
             if (cursor != null && bucketInstant != null && !bucketInstant.isAfter(cursor)) continue
 
             val binningName = row.valueOf(header, "binning_data") ?: continue
@@ -497,7 +535,12 @@ object SamsungHealthExportImporter {
         for (row in dataRows) {
             val startRaw = row.valueOf(header, "start_time") ?: continue
             val score = row.valueOf(header, "score")?.toDoubleOrNull() ?: continue
-            val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "time_offset")) ?: continue
+            // `start_time` is a UTC instant despite the `time_offset` beside it -- the same quirk as the
+            // exercise, blood-pressure and sleep fields. Confirmed from a raw export: for every type
+            // marked UTC the clock peaks exactly where real behaviour does once shifted by the
+            // offset (awake metrics 09:00-24:00 local, sleep-time ones 23:00-08:00). Reading it as
+            // local time put every reading nine hours early.
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = instant.atZone(ZoneId.systemDefault()).toLocalDate()
             if (!day.isBefore(today)) continue
@@ -565,7 +608,12 @@ object SamsungHealthExportImporter {
             val startRaw = row.valueOf(header, "start_time") ?: continue
             val score = row.valueOf(header, "antioxidant")?.toDoubleOrNull() ?: continue
             val datauuid = row.valueOf(header, "datauuid") ?: continue
-            val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "time_offset")) ?: continue
+            // `start_time` is a UTC instant despite the `time_offset` beside it -- the same quirk as the
+            // exercise, blood-pressure and sleep fields. Confirmed from a raw export: for every type
+            // marked UTC the clock peaks exactly where real behaviour does once shifted by the
+            // offset (awake metrics 09:00-24:00 local, sleep-time ones 23:00-08:00). Reading it as
+            // local time put every reading nine hours early.
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = instant.atZone(ZoneId.systemDefault()).toLocalDate()
             if (!day.isBefore(today)) continue
@@ -846,7 +894,12 @@ object SamsungHealthExportImporter {
         for (row in dataRows) {
             val startRaw = row.valueOf(header, "start_time") ?: continue
             val temperature = row.valueOf(header, "temperature")?.toDoubleOrNull() ?: continue
-            val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "time_offset")) ?: continue
+            // `start_time` is a UTC instant despite the `time_offset` beside it -- the same quirk as the
+            // exercise, blood-pressure and sleep fields. Confirmed from a raw export: for every type
+            // marked UTC the clock peaks exactly where real behaviour does once shifted by the
+            // offset (awake metrics 09:00-24:00 local, sleep-time ones 23:00-08:00). Reading it as
+            // local time put every reading nine hours early.
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = sleepDayOf(instant)
             if (!isCompleteSleepDay(day)) continue
@@ -894,7 +947,12 @@ object SamsungHealthExportImporter {
         for (row in dataRows) {
             val startRaw = row.valueOf(header, "start_time") ?: continue
             val durationMs = row.valueOf(header, "duration")?.toDoubleOrNull() ?: continue
-            val instant = parseLocalDateTimeWithOffset(startRaw, row.valueOf(header, "time_offset")) ?: continue
+            // `start_time` is a UTC instant despite the `time_offset` beside it -- the same quirk as the
+            // exercise, blood-pressure and sleep fields. Confirmed from a raw export: for every type
+            // marked UTC the clock peaks exactly where real behaviour does once shifted by the
+            // offset (awake metrics 09:00-24:00 local, sleep-time ones 23:00-08:00). Reading it as
+            // local time put every reading nine hours early.
+            val instant = parseLocalDateTimeAsUtc(startRaw) ?: continue
             if (cursor != null && !instant.isAfter(cursor)) continue
             val day = sleepDayOf(instant)
             if (!isCompleteSleepDay(day)) continue
@@ -1132,7 +1190,7 @@ object SamsungHealthExportImporter {
      * backup; there was no reason to assume the other Samsung export types couldn't carry the
      * same kind of bad row, so this isn't scoped to just the one observed so far.
      */
-    private fun parseLocalDateTimeWithOffset(raw: String, offsetRaw: String?): Instant? {
+    private fun parseLocalDateTimeWithOffset(raw: String, offsetRaw: String?): Instant? {  // now only for fields verified to be genuinely local
         val localDateTime = runCatching { LocalDateTime.parse(raw, LOCAL_DATETIME_FORMAT) }.getOrNull() ?: return null
         val offset = offsetRaw?.let { UTC_OFFSET_PATTERN.find(it) }
             ?.let { m -> runCatching { ZoneOffset.of("${m.groupValues[1]}:${m.groupValues[2]}") }.getOrNull() }
